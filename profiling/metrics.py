@@ -36,6 +36,9 @@ class KernelProfile:
     duration_us: float = 0.0  # microseconds, summed over all invocations
     invocation_count: int = 1
 
+    # Stability across invocations (coefficient of variation)
+    cv_pct: float = 0.0
+
     # Tensor core activity
     tensor_core_insts: float = 0.0
 
@@ -48,6 +51,14 @@ class KernelProfile:
     raw: dict = field(default_factory=dict)
 
     # ── Derived properties ──────────────────────────────────────────────────
+
+    @property
+    def duration_ms(self) -> float:
+        return self.duration_us / 1000.0
+
+    @property
+    def dram_bw_pct(self) -> float:
+        return self.mem_pct
 
     @property
     def fp_total(self) -> float:
@@ -69,7 +80,7 @@ class KernelProfile:
             f"{name}\n"
             f"  [{self.bottleneck or '?'}]  SM={self.sm_pct:.1f}%  MEM={self.mem_pct:.1f}%  "
             f"occ={self.occupancy:.1f}%  L2={self.l2_hit_rate:.1f}%  "
-            f"dur={self.duration_us:.1f}µs  n={self.invocation_count}"
+            f"dur={self.duration_us:.1f}µs  cv={self.cv_pct:.1f}%  n={self.invocation_count}"
         )
 
 

@@ -3,20 +3,17 @@
 Launches a target script under Nsight Compute, writes a CSV report, then
 parses it into a list of KernelProfile objects ready for Stage 2.
 
-Typical usage:
+Two interfaces:
 
-    python -m profiling.ncu_runner \\
-        --script kernels/mla_reconstruction.py \\
-        --args "--model deepseek-v3 --ncu-mode" \\
-        --output data/mla_v3_bs1.csv \\
-        --label "mla_v3_decode_bs1"
+  1. Functional (existing):
+       csv_path = run_ncu("kernels/mla_reconstruction.py", args="--ncu-mode")
+       profiles = load_profiles(csv_path)
 
-Or from Python:
-
-    from profiling.ncu_runner import run_ncu, parse_ncu_csv, load_profiles
-    csv_path = run_ncu("kernels/mla_reconstruction.py", args="--ncu-mode",
-                       output="data/out.csv")
-    profiles = load_profiles(csv_path)
+  2. Class-based (NcuRunner):
+       runner  = NcuRunner(gpu="h100")
+       profiles = runner.run(kernel_fn, warmup=10, iters=5)
+       profiles = runner.profile_script("kernels/mla_reconstruction.py",
+                                        args="--ncu-mode")
 """
 
 from __future__ import annotations
@@ -29,14 +26,35 @@ import shutil
 import subprocess
 import sys
 from collections import defaultdict
-from typing import List, Optional
+from dataclasses import dataclass
+from typing import Callable, List, Optional
 
 from profiling.metrics import KernelProfile
 
 
-# ── NCU invocation ────────────────────────────────────────────────────────────
+# ── GPU specs ─────────────────────────────────────────────────────────────────
 
-# Metrics we ask NCU to collect.  Extend as needed.
+@dataclass(frozen=True)
+class GpuSpec:
+    name: str
+    l2_cache_mb: float
+    hbm_bw_gbs: float      # GB/s
+    fp16_tflops: float      # TFLOPS
+
+    @property
+    def crossover_ai(self) -> float:
+        """Arithmetic intensity (FLOP/byte) where roofline transitions."""
+        return (self.fp16_tflops * 1e3) / self.hbm_bw_gbs
+
+
+GPU_SPECS: dict[str, GpuSpec] = {
+    "h100": GpuSpec("H100 SXM5", l2_cache_mb=50.0, hbm_bw_gbs=3350.0, fp16_tflops=989.0),
+    "a100": GpuSpec("A100 SXM",  l2_cache_mb=40.0, hbm_bw_gbs=2039.0, fp16_tflops=312.0),
+}
+
+
+# ── NCU metrics we collect ────────────────────────────────────────────────────
+
 _NCU_METRICS = ",".join([
     "sm__throughput.avg.pct_of_peak_sustained_elapsed",
     "dram__throughput.avg.pct_of_peak_sustained_elapsed",
@@ -57,6 +75,8 @@ _NCU_METRICS = ",".join([
 ])
 
 
+# ── NCU binary discovery ─────────────────────────────────────────────────────
+
 def _ncu_binary() -> str:
     ncu = shutil.which("ncu") or shutil.which("nv-nsight-cu-cli")
     if ncu is None:
@@ -66,6 +86,8 @@ def _ncu_binary() -> str:
         )
     return ncu
 
+
+# ── Functional interface (kept for backward compat) ───────────────────────────
 
 def run_ncu(
     script: str,
@@ -197,9 +219,12 @@ def rows_to_profiles(rows: list[dict]) -> List[KernelProfile]:
         rep = invs[0]
         g = lambda col: _safe_float(rep.get(col, "0")) if col else 0.0
 
-        total_dur = sum(_safe_float(inv.get(dur_col, "0")) for inv in invs) if dur_col else 0.0
-        # NCU reports duration in nanoseconds; convert to microseconds
-        dur_us = total_dur / 1000.0
+        # Per-invocation durations for CV computation
+        inv_durs = [_safe_float(inv.get(dur_col, "0")) for inv in invs] if dur_col else []
+        total_dur_ns = sum(inv_durs)
+        dur_us = total_dur_ns / 1000.0
+
+        cv_pct = _cv_pct(inv_durs)
 
         l1h, l1m = g(l1h_col), g(l1m_col)
         l2h, l2m = g(l2h_col), g(l2m_col)
@@ -217,6 +242,7 @@ def rows_to_profiles(rows: list[dict]) -> List[KernelProfile]:
             grid_size=int(g(grid_col)),
             duration_us=dur_us,
             invocation_count=len(invs),
+            cv_pct=cv_pct,
             l1_hit_rate=l1_rate,
             l2_hit_rate=l2_rate,
             tensor_core_insts=g(tc_col),
@@ -229,9 +255,157 @@ def rows_to_profiles(rows: list[dict]) -> List[KernelProfile]:
     return profiles
 
 
+def _cv_pct(values: list[float]) -> float:
+    """Coefficient of variation (%) from a list of measurements."""
+    if len(values) < 2:
+        return 0.0
+    mean = sum(values) / len(values)
+    if mean <= 0:
+        return 0.0
+    var = sum((v - mean) ** 2 for v in values) / len(values)
+    return 100.0 * (var ** 0.5) / mean
+
+
 def load_profiles(csv_path: str) -> List[KernelProfile]:
     """Parse an NCU CSV and return KernelProfile list (no classification yet)."""
     return rows_to_profiles(parse_ncu_csv(csv_path))
+
+
+# ── NcuRunner class ───────────────────────────────────────────────────────────
+
+def _resolve_gpu(gpu: str) -> str:
+    """Map user-supplied gpu string to a key in GPU_SPECS."""
+    if gpu != "auto":
+        key = gpu.lower().replace(" ", "").replace("-", "")
+        return key if key in GPU_SPECS else "h100"
+    try:
+        import torch
+        name = torch.cuda.get_device_name(0).lower()
+        for key in GPU_SPECS:
+            if key in name:
+                return key
+    except Exception:
+        pass
+    return "h100"
+
+
+class NcuRunner:
+    """High-level interface for profiling GPU kernels via Nsight Compute.
+
+    Usage::
+
+        runner = NcuRunner(gpu="h100")
+
+        # Profile a callable (must be importable, not a closure)
+        profiles = runner.run(my_kernel_fn, warmup=10, iters=5)
+
+        # Profile an existing script
+        profiles = runner.profile_script("kernels/mla_reconstruction.py",
+                                         args="--ncu-mode")
+
+    Each returned KernelProfile includes cv_pct (coefficient of variation
+    across invocations) and the full counter set from NCU.
+    """
+
+    def __init__(
+        self,
+        gpu: str = "auto",
+        output_dir: str = "data",
+    ):
+        self.gpu_key = _resolve_gpu(gpu)
+        self.spec = GPU_SPECS.get(self.gpu_key, GPU_SPECS["h100"])
+        self.output_dir = output_dir
+        os.makedirs(output_dir, exist_ok=True)
+
+    # ── Public API ────────────────────────────────────────────────────────
+
+    def run(
+        self,
+        kernel_fn: Callable,
+        *args,
+        warmup: int = 10,
+        iters: int = 5,
+        kernel_regex: Optional[str] = None,
+        label: Optional[str] = None,
+    ) -> List[KernelProfile]:
+        """Profile *kernel_fn(*args)* under NCU.
+
+        The callable must be a module-level function (importable by its
+        ``__module__`` and ``__name__``).  It should allocate any required
+        tensors internally; tensor arguments are not serialisable across
+        the subprocess boundary.
+
+        Returns a list of ``KernelProfile`` objects (one per unique GPU
+        kernel captured by NCU).
+        """
+        label = label or kernel_fn.__name__
+        script_path = self._gen_script(kernel_fn, args, warmup, iters)
+        csv_path = os.path.join(self.output_dir, f"{label}.csv")
+
+        run_ncu(
+            script_path,
+            output=csv_path,
+            kernel_regex=kernel_regex,
+            extra_ncu_flags="--profile-from-start off",
+        )
+        return load_profiles(csv_path)
+
+    def profile_script(
+        self,
+        script: str,
+        args: str = "",
+        kernel_regex: Optional[str] = None,
+        label: Optional[str] = None,
+    ) -> List[KernelProfile]:
+        """Run an existing Python script under NCU and return profiles."""
+        label = label or os.path.splitext(os.path.basename(script))[0]
+        csv_path = os.path.join(self.output_dir, f"{label}.csv")
+
+        run_ncu(script, args=args, output=csv_path, kernel_regex=kernel_regex)
+        return load_profiles(csv_path)
+
+    # ── Internals ─────────────────────────────────────────────────────────
+
+    def _gen_script(
+        self,
+        fn: Callable,
+        args: tuple,
+        warmup: int,
+        iters: int,
+    ) -> str:
+        """Generate a temporary Python script that calls *fn* under profiler
+        brackets so NCU only captures the measured iterations."""
+        mod = fn.__module__
+        name = fn.__name__
+        args_repr = ", ".join(repr(a) for a in args)
+
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+        code = (
+            f"import sys, os\n"
+            f"sys.path.insert(0, {project_root!r})\n"
+            f"os.chdir({project_root!r})\n"
+            f"import torch\n"
+            f"from {mod} import {name}\n"
+            f"\n"
+            f"for _ in range({warmup}):\n"
+            f"    {name}({args_repr})\n"
+            f"torch.cuda.synchronize()\n"
+            f"\n"
+            f"torch.cuda.cudart().cudaProfilerStart()\n"
+            f"for _ in range({iters}):\n"
+            f"    {name}({args_repr})\n"
+            f"    torch.cuda.synchronize()\n"
+            f"torch.cuda.cudart().cudaProfilerStop()\n"
+        )
+
+        path = os.path.join(self.output_dir, f"_ncu_tmp_{fn.__name__}.py")
+        with open(path, "w") as f:
+            f.write(code)
+        return path
+
+    def __repr__(self) -> str:
+        return f"NcuRunner(gpu={self.gpu_key!r}, spec={self.spec.name})"
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────

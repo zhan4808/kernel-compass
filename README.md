@@ -1,7 +1,7 @@
 # kernel-compass
 
 Automated GPU kernel optimization loop for transformer inference, seeded from
-the [cache-barrier](../cache-barrier) paper on MLA reconstruction GEMMs.
+the [cache-barrier](https://github.com/zhan4808/cache-barrier) paper on MLA reconstruction GEMMs.
 
 ## Pipeline
 
