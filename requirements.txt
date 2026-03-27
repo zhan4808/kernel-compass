@@ -3,3 +3,4 @@ triton
 numpy
 pandas
 anthropic
+cloudpickle
