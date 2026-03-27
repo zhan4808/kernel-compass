@@ -1,0 +1,27 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.so
+
+# Triton JIT cache
+~/.triton/
+
+# Data outputs (all generated files)
+data/*
+!data/.gitkeep
+
+# NCU raw reports
+*.ncu-rep
+
+# Compiled CUDA artifacts
+*.ptx
+*.cubin
+*.fatbin
