@@ -1,2 +1,6 @@
 torch>=2.1
 triton>=3.0
+numpy
+pandas
+anthropic
+cloudpickle

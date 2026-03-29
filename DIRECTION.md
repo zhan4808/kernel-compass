@@ -1,74 +1,47 @@
 # kernel-compass
 
-Counter-grounded kernel optimization loop. Uses Nsight Compute hardware
-counters as the feedback signal — diagnosing what's wrong before generating
-a fix, and verifying the fix improved the right metric, not just latency.
+Counter-grounded kernel optimization loop using hardware counters (or CUPTI
+fallback) as the feedback signal.
 
-## Motivation
+## Current status
 
-The MLA L2 cache barrier finding (see cache-barrier repo) is the proof-of-concept:
-a latency-only optimization loop would accept INT4 regression at bs=1 because
-INT4 runs in finite time. A counter-grounded loop would catch it because
-DRAM utilization did not improve and SM saturation increased.
+- Stage 1 profiling: working (`NcuRunner` + `CuptiRunner` fallback)
+- Stage 2 classification: working (4-class taxonomy)
+- Stage 3 optimization loop: working (`--demo`, `--compare`)
+- Stage 4 LLM generation: scaffolded (`optimizer/llm.py`) with heuristic fallback
 
-Existing LLM kernel generation systems (KernelGen, KernelEvolve) use throughput
-as the sole reward signal — blind to why a kernel is slow. This project builds
-the counter-grounded feedback loop those systems lack.
+Validation currently passes end-to-end:
 
-## Architecture
+- `python tests/test_validation.py`
+- `python tests/test_validation.py --ncu`
 
-Stage 1 — Profile:     NcuRunner → KernelProfile (counters + latency)
-Stage 2 — Diagnose:    heuristic classifier → BottleneckClass
-Stage 3 — Generate:    LLM generates configs conditioned on bottleneck class
-Stage 4 — Verify:      accept only if target counter metric improves
-Stage 5 — Iterate:     loop until convergence or budget
+## Core result (demo-ready)
 
-## The killer demo
+The loop distinguishes `l2_bound` from `memory_bound` and makes opposite
+recommendations automatically:
 
-Target: MLA reconstruction GEMM at M=1, weight=16MB (L2-resident)
-Expected: latency-only loop accepts INT4 (0.49x cuBLAS)
-Goal: counter-grounded loop diagnoses L2 residency, rejects INT4,
-      reports "DRAM utilization unchanged, SM saturation increased"
+- L2-resident MLA shape (16MB) -> reject quantization
+- HBM-bound MLA shape (128MB) -> accept quantization when it helps
 
-Ground truth data is in the cache-barrier repo (Section 5.5 of paper).
+This is the key contrast missing from latency-only optimization loops.
 
-## Status
+## Compare-mode metrics
 
-Stage 1 (NcuRunner): IN PROGRESS
-Stage 2 (Classifier): TODO
-Stage 3-5 (Optimizer loop): TODO
+`python -m optimizer.loop --compare` now reports:
 
-## Next immediate task
+- iterations to first acceptance
+- wasted profiling runs before first acceptance
 
-Implement NcuRunner in profiling/ncu_runner.py.
+This supports the central claim: diagnosis-conditioned generation can avoid
+wasted runs on shapes where counter evidence already rules out the optimization.
 
-Target interface:
-    runner = NcuRunner(gpu="h100")
-    profile = runner.run(kernel_fn, *args, warmup=10, iters=5)
-    # returns KernelProfile with:
-    #   dram_bw_pct, sm_utilization, l2_hit_rate,
-    #   occupancy_pct, registers_per_thread, duration_ms, cv_pct
+## Immediate focus
 
-Validate on three known cases from cache-barrier paper:
-  1. cuBLAS FP16 bmm, weight=16MB  → low DRAM (~35%), L2-resident
-  2. INT4 Triton kernel, weight=16MB → high SM (~70%), low DRAM (~20%)
-  3. cuBLAS FP16 bmm, weight=128MB  → high DRAM (~83%), HBM-bound
-
-All three expected outputs documented in cache-barrier/paper/sglang_mla.pdf
-Section 5.5 and Table 11.
-
-## Key reference
-
-cache-barrier repo: github.com/zhan4808/cache-barrier
-Paper: arxiv link (pending)
-```
-
-**.gitignore:**
-```
-*.ncu-rep
-*.nsys-rep
-*.sqlite
-__pycache__/
-*.pyc
-*.csv
-data/*.json
+1. Finalize and submit cache-barrier arXiv paper.
+2. Send Dr. Lin outreach/proposal with:
+   - cache-barrier result
+   - kernel-compass end-to-end demo status
+   - planned Stage 4 LLM contribution
+3. Continue Stage 4 in parallel after outreach:
+   - robust Claude API integration
+   - side-by-side evaluation vs grid baseline.

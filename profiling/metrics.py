@@ -1,109 +1,110 @@
-"""KernelProfile dataclass — the shared currency between all pipeline stages."""
+"""Core profiling data models."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class GpuSpec:
+    name: str
+    hbm_bw_gbs: float
+    l2_cache_mb: float
+    fp16_tflops: float
+
+
+GPU_SPECS: dict[str, GpuSpec] = {
+    "h100": GpuSpec(name="NVIDIA H100 SXM5", hbm_bw_gbs=3350.0, l2_cache_mb=50.0, fp16_tflops=989.0),
+    "a100": GpuSpec(name="NVIDIA A100 SXM4", hbm_bw_gbs=2039.0, l2_cache_mb=40.0, fp16_tflops=312.0),
+}
 
 
 @dataclass
 class KernelProfile:
-    """One profiled kernel invocation as seen by NCU."""
+    """One profiled kernel aggregate."""
 
     kernel_name: str
-
-    # Throughput (% of peak)
-    sm_pct: float = 0.0       # SM / compute throughput
-    mem_pct: float = 0.0      # DRAM throughput
-
-    # Classification (filled by bottleneck.py)
-    bottleneck: str = ""       # "COMPUTE-BOUND" | "MEMORY-BOUND" | "LATENCY-BOUND" | "BALANCED"
-
-    # Occupancy
-    occupancy: float = 0.0    # achieved occupancy %
-    active_warps_pct: float = 0.0
-
-    # Cache hit rates (0–100)
+    sm_pct: float = 0.0
+    mem_pct: float = 0.0
+    occupancy: float = 0.0
     l1_hit_rate: float = 0.0
     l2_hit_rate: float = 0.0
-
-    # Launch geometry
+    tensor_core_ratio: float = 0.0
+    registers_per_thread: int = 0
     block_size: int = 0
     grid_size: int = 0
-    registers_per_thread: int = 0
-
-    # Timing
-    duration_us: float = 0.0  # microseconds, summed over all invocations
+    duration_us: float = 0.0
     invocation_count: int = 1
-
-    # Stability across invocations (coefficient of variation)
     cv_pct: float = 0.0
-
-    # Tensor core activity
-    tensor_core_insts: float = 0.0
-
-    # FP op mix (instruction counts)
-    fp_fadd: float = 0.0
-    fp_fmul: float = 0.0
-    fp_ffma: float = 0.0
-
-    # Raw NCU row (preserved for downstream inspection)
-    raw: dict = field(default_factory=dict)
-
-    # ── Derived properties ──────────────────────────────────────────────────
+    bottleneck: str = ""
+    source: str = "ncu"
 
     @property
-    def duration_ms(self) -> float:
-        return self.duration_us / 1000.0
+    def avg_duration_us(self) -> float:
+        return self.duration_us / max(self.invocation_count, 1)
+
+    @property
+    def sm_utilization(self) -> float:
+        return self.sm_pct
+
+    @property
+    def occupancy_pct(self) -> float:
+        return self.occupancy
 
     @property
     def dram_bw_pct(self) -> float:
         return self.mem_pct
 
     @property
-    def fp_total(self) -> float:
-        return self.fp_fadd + self.fp_fmul + self.fp_ffma
-
-    @property
-    def tensor_core_ratio(self) -> float:
-        """Fraction of FP work done on tensor cores (0–1)."""
-        denom = self.tensor_core_insts + self.fp_total
-        return self.tensor_core_insts / denom if denom > 0 else 0.0
-
-    @property
-    def avg_duration_us(self) -> float:
-        return self.duration_us / self.invocation_count if self.invocation_count else 0.0
+    def is_estimated(self) -> bool:
+        return self.source != "ncu"
 
     def summary(self) -> str:
-        name = self.kernel_name if len(self.kernel_name) <= 60 else self.kernel_name[:28] + "…" + self.kernel_name[-29:]
+        est = " [estimated]" if self.is_estimated else ""
         return (
-            f"{name}\n"
-            f"  [{self.bottleneck or '?'}]  SM={self.sm_pct:.1f}%  MEM={self.mem_pct:.1f}%  "
-            f"occ={self.occupancy:.1f}%  L2={self.l2_hit_rate:.1f}%  "
-            f"dur={self.duration_us:.1f}µs  cv={self.cv_pct:.1f}%  n={self.invocation_count}"
+            f"{self.kernel_name}: sm={self.sm_pct:.1f}% dram={self.mem_pct:.1f}% "
+            f"l2={self.l2_hit_rate:.1f}% lat={self.avg_duration_us:.1f}us{est}"
         )
 
 
 @dataclass
 class BMMProfile:
-    """Timing result for a single batched-matmul variant (used by kernels/)."""
+    """Timing-level summary for reconstruction BMM."""
 
-    label: str          # e.g. "fp16_bmm1", "int4_bmm2"
+    label: str
     H: int
-    M: int              # batch size
+    M: int
     K: int
     N: int
-    dtype: str          # "fp16" | "int4"
-
+    dtype: str
     median_ms: float = 0.0
     tflops: float = 0.0
     bandwidth_gbs: float = 0.0
 
     @classmethod
-    def from_timing(cls, label: str, H: int, M: int, K: int, N: int,
-                    dtype: str, median_ms: float, weight_bytes: int) -> "BMMProfile":
-        flops = 2 * H * M * K * N
-        bw = (weight_bytes / 1e9) / (median_ms / 1e3) if median_ms > 0 else 0.0
-        tf = (flops / 1e12) / (median_ms / 1e3) if median_ms > 0 else 0.0
-        return cls(label=label, H=H, M=M, K=K, N=N, dtype=dtype,
-                   median_ms=median_ms, tflops=tf, bandwidth_gbs=bw)
+    def from_timing(
+        cls,
+        label: str,
+        H: int,
+        M: int,
+        K: int,
+        N: int,
+        dtype: str,
+        median_ms: float,
+        weight_bytes: float,
+    ) -> "BMMProfile":
+        sec = max(median_ms, 1e-9) / 1e3
+        flops = 2.0 * H * M * K * N
+        tflops = flops / sec / 1e12
+        bandwidth_gbs = weight_bytes / sec / 1e9
+        return cls(
+            label=label,
+            H=H,
+            M=M,
+            K=K,
+            N=N,
+            dtype=dtype,
+            median_ms=median_ms,
+            tflops=tflops,
+            bandwidth_gbs=bandwidth_gbs,
+        )

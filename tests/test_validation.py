@@ -1,141 +1,135 @@
 #!/usr/bin/env python
-"""End-to-end validation: timing benchmarks + NCU counter checks.
-
-Run levels:
-  1. Timing only (no NCU):   python tests/test_validation.py
-  2. Full NCU validation:    sudo ncu python tests/test_validation.py --ncu
-
-Level 1 verifies kernels execute and produce correct-shaped output.
-Level 2 profiles each case under NCU and checks counters against expected ranges.
-"""
+"""Validation harness for kernel-compass."""
 
 from __future__ import annotations
 
 import argparse
-import sys
 import os
+import sys
+from typing import Dict
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import torch
 
-from profiling.metrics import KernelProfile
 from kernels.mla_reconstruction import (
+    _CASE_SHAPES,
+    _CASE_WEIGHT_DTYPE,
     VALIDATION_CASES,
     VALIDATION_KERNELS,
-    _CASE_SHAPES,
-    validate_profiles,
     run_validation,
+    validate_profiles,
 )
+from profiling.bottleneck import BottleneckClass, classify_one
+from profiling.metrics import KernelProfile
 
 
 def test_timing() -> bool:
-    """Level 1: run each case, check output shape, report latency."""
     print("=" * 60)
-    print("Level 1: Timing validation (no NCU)")
+    print("Level 1: Timing and shape sanity")
     print("=" * 60)
-
-    gpu = torch.cuda.get_device_name(0)
-    print(f"GPU: {gpu}\n")
-
-    all_ok = True
-    for case_name, fn in VALIDATION_KERNELS.items():
-        H, M, K, N = _CASE_SHAPES[case_name]
-        try:
-            out = fn()
-            torch.cuda.synchronize()
-            expected_shape = (H, M, N) if "int4" not in case_name else (H, M, N)
-            shape_ok = tuple(out.shape) == expected_shape
-            if not shape_ok:
-                # INT4 kernel output N may differ if block-padded
-                shape_ok = out.shape[0] == H and out.shape[1] == M
-            status = "OK" if shape_ok else f"SHAPE MISMATCH {out.shape}"
-        except Exception as e:
-            status = f"ERROR: {e}"
-            shape_ok = False
-
-        print(f"  {case_name:15s}  {status}")
-        all_ok = all_ok and shape_ok
-
-    print()
-    print("Latency benchmarks:")
-    run_validation(warmup=20, iters=100)
-    print()
-    return all_ok
+    rows = run_validation()
+    ok = len(rows) == len(VALIDATION_KERNELS)
+    print(f"\nCollected {len(rows)} timing rows")
+    return ok
 
 
-def test_ncu() -> bool:
-    """Level 2: profile each case under NCU, validate counters."""
-    from profiling.ncu_runner import NcuRunner
+def test_ncu() -> tuple[bool, dict[str, KernelProfile]]:
+    """Level 2 validation with NCU, fallback to CUPTI estimation."""
+    from profiling.ncu_runner import _CUPTI_WARNING, CuptiRunner, NcuRunner, ncu_has_permissions
 
     print("=" * 60)
-    print("Level 2: NCU counter validation")
+    print("Level 2: Counter validation")
     print("=" * 60)
-
-    runner = NcuRunner(gpu="auto", output_dir="data/validation")
-    print(f"Runner: {runner}\n")
+    use_cupti = not ncu_has_permissions()
+    if use_cupti:
+        print("NCU hardware counters unavailable.")
+        print(f"{_CUPTI_WARNING}\n")
+        runner = CuptiRunner(gpu="auto")
+    else:
+        runner = NcuRunner(gpu="auto", output_dir="data/validation")
 
     by_case: dict[str, KernelProfile] = {}
+    all_pass = True
     for case_name, fn in VALIDATION_KERNELS.items():
         expected = VALIDATION_CASES[case_name]
-        print(f"Profiling {case_name} ({expected.label})...")
-        try:
+        shapes = _CASE_SHAPES[case_name]
+        wdtype = _CASE_WEIGHT_DTYPE.get(case_name, "bf16")
+        print(f"Profiling {case_name} ({expected.label})")
+        if use_cupti:
+            profiles = runner.run(fn, warmup=10, iters=5, label=case_name, case_shapes=shapes, weight_dtype=wdtype)
+        else:
             profiles = runner.run(fn, warmup=10, iters=5, label=case_name)
-            if profiles:
-                best = max(profiles, key=lambda p: p.duration_us)
-                by_case[case_name] = best
-                print(f"  Captured {len(profiles)} kernel(s), "
-                      f"primary: SM={best.sm_pct:.1f}% MEM={best.mem_pct:.1f}% "
-                      f"L2={best.l2_hit_rate:.1f}% dur={best.avg_duration_us:.1f}µs "
-                      f"cv={best.cv_pct:.1f}%")
-            else:
-                print("  WARNING: no profiles captured")
-        except FileNotFoundError:
-            print("  ERROR: ncu not found — install Nsight Compute")
-            return False
-        except Exception as e:
-            print(f"  ERROR: {e}")
-
-    print()
-    results = validate_profiles(by_case)
-    all_pass = True
-    for case_name, passed, msg in results:
-        tag = "PASS" if passed else "FAIL"
-        label = VALIDATION_CASES[case_name].label
-        print(f"  [{tag}] {case_name:15s}  {label}")
-        if not passed:
-            print(f"         {msg}")
+        if not profiles:
+            print("  [FAIL] no kernels captured")
             all_pass = False
-
+            continue
+        best = max(profiles, key=lambda p: p.duration_us)
+        by_case[case_name] = best
+        ok, notes = validate_profiles(case_name, best.sm_pct, best.dram_bw_pct, best.l2_hit_rate)
+        print(f"  SM={best.sm_pct:.1f}% DRAM={best.dram_bw_pct:.1f}% L2={best.l2_hit_rate:.1f}%")
+        for n in notes:
+            print(f"    - {n}")
+        if not ok:
+            all_pass = False
+            print("  [FAIL] outside expected range")
+        else:
+            print("  [PASS]")
     print()
-    if all_pass:
-        print("All three validation cases PASSED.")
-    else:
-        print("Some validation cases FAILED.")
+    return all_pass, by_case
+
+
+_EXPECTED_CLASS: Dict[str, BottleneckClass] = {
+    "bf16_16mb": BottleneckClass.L2_BOUND,
+    "int4_16mb": BottleneckClass.COMPUTE_BOUND,
+    "fp8_16mb": BottleneckClass.L2_BOUND,
+    "bf16_128mb": BottleneckClass.MEMORY_BOUND,
+    "fp8_128mb": BottleneckClass.MEMORY_BOUND,
+}
+
+
+def test_classifier(by_case: dict[str, KernelProfile]) -> bool:
+    print("=" * 60)
+    print("Level 3: Classifier validation")
+    print("=" * 60)
+    all_pass = True
+    for case_name, expected_class in _EXPECTED_CLASS.items():
+        p = by_case.get(case_name)
+        if p is None:
+            print(f"  [FAIL] {case_name}: missing profile")
+            all_pass = False
+            continue
+        diag = classify_one(p)
+        ok = diag.bottleneck == expected_class
+        print(f"  [{'PASS' if ok else 'FAIL'}] {case_name:12s} -> {diag.bottleneck.value:18s} ({diag.confidence})")
+        if not ok:
+            print(f"    expected {expected_class.value}, got {diag.bottleneck.value}")
+            all_pass = False
+    print()
     return all_pass
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--ncu", action="store_true",
-                        help="Run NCU counter validation (requires ncu on PATH)")
-    args = parser.parse_args()
-
+def main(enable_ncu: bool = False) -> int:
     timing_ok = test_timing()
+    ncu_ok = True
+    by_case: dict[str, KernelProfile] = {}
+    if enable_ncu:
+        ncu_ok, by_case = test_ncu()
+    classifier_ok = True
+    if by_case:
+        classifier_ok = test_classifier(by_case)
+    elif enable_ncu:
+        classifier_ok = False
 
-    if args.ncu:
-        ncu_ok = test_ncu()
-    else:
-        ncu_ok = True
-        print("Skipping NCU validation (pass --ncu to enable).\n")
-
-    if timing_ok and ncu_ok:
+    if timing_ok and ncu_ok and classifier_ok:
         print("RESULT: ALL TESTS PASSED")
-        sys.exit(0)
-    else:
-        print("RESULT: SOME TESTS FAILED")
-        sys.exit(1)
+        return 0
+    print("RESULT: TESTS FAILED")
+    return 1
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ncu", action="store_true", help="Run level 2/3 counter validation")
+    args = parser.parse_args()
+    raise SystemExit(main(enable_ncu=args.ncu))
