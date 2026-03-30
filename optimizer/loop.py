@@ -13,9 +13,12 @@ from profiling.metrics import KernelProfile
 
 _BC = BottleneckClass
 
+# Baseline for experiments: BF16. FP8 row describes the *current* Triton path only.
 PRECISION_TIERS: dict[str, dict] = {
     "bf16": {"bytes_per_param": 2, "hw_native": True, "dequant_overhead": False},
-    "fp8": {"bytes_per_param": 1, "hw_native": True, "dequant_overhead": False},
+    # Current implementation: FP8 weights, FP16 activations, FP16 compute in Triton
+    # (W8A16). Does not use H100 native FP8 tensor cores (W8A8); see cuBLASLt/TE TODO.
+    "fp8": {"bytes_per_param": 1, "hw_native": False, "dequant_overhead": False},
     "int8": {"bytes_per_param": 1, "hw_native": True, "dequant_overhead": False},
     "int4": {"bytes_per_param": 0.5, "hw_native": False, "dequant_overhead": True},
     "nvfp4": {"bytes_per_param": 0.5, "hw_native": True, "dequant_overhead": False},
@@ -51,13 +54,16 @@ class LoopState:
 
 
 def enumerate_configs(bottleneck: BottleneckClass, current_precision: str) -> list[GridConfig]:
-    if bottleneck in (_BC.L2_BOUND, _BC.MEMORY_BOUND):
+    # L2-resident: counter-grounded path rejects quantization; do not enumerate wasted runs.
+    if bottleneck == _BC.L2_BOUND:
+        return []
+    if bottleneck == _BC.MEMORY_BOUND:
         if current_precision in ("bf16", "fp16"):
             return [
-                GridConfig("fp8", "FP8 W8A16 (hw-native, recommended)"),
+                GridConfig("fp8", "FP8 weight-only W8A16 (recommended before INT4)"),
                 GridConfig("int4", "INT4 W4A16 (aggressive)"),
             ]
-        if current_precision == "fp8" and bottleneck == _BC.MEMORY_BOUND:
+        if current_precision == "fp8":
             return [GridConfig("int4", "INT4 W4A16 (aggressive)")]
     return []
 

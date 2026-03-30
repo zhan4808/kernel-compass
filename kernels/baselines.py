@@ -1,4 +1,7 @@
-"""Baseline BMM wrappers: BF16 cuBLAS, INT4 Triton W4A16, FP8 Triton W8A16."""
+"""Baseline BMM wrappers: BF16 cuBLAS, INT4 Triton W4A16, FP8 weight-only W8A16 (Triton).
+
+FP8 path: FP8 weights dequantized to FP16 for tl.dot — not native W8A8 tensor-core GEMM.
+"""
 
 from __future__ import annotations
 

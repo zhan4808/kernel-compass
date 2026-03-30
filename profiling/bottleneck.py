@@ -42,7 +42,8 @@ def classify_one(p: KernelProfile) -> Diagnosis:
             "high",
             (
                 f"DRAM at {p.dram_bw_pct:.0f}% of peak. Kernel is HBM-bound. "
-                "FP8 is the first recommendation; INT4 only when memory footprint is the constraint."
+                "Use FP8 weight-only (W8A16) before INT4. "
+                "Native FP8 W8A8 tensor-core path is future work."
             ),
         )
 
@@ -78,7 +79,8 @@ def classify(profiles: list[KernelProfile]) -> list[KernelProfile]:
 
 _OBSERVATION: Dict[str, str] = {
     BottleneckClass.MEMORY_BOUND.value: (
-        "**HBM-bandwidth limited.** Prefer FP8 first on H100+, then INT4/NVFP4 when footprint dominates."
+        "**HBM-bandwidth limited.** Prefer FP8 weight-only (W8A16) first, then INT4/NVFP4 when footprint dominates. "
+        "Native FP8 W8A8 path is not yet wired."
     ),
     BottleneckClass.L2_BOUND.value: (
         "**L2-resident.** HBM traffic is not the bottleneck; quantization usually does not help latency."

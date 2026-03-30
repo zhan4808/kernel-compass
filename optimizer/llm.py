@@ -65,9 +65,14 @@ Allowed search space:
 {space_json}
 
 Rules:
-- For MEMORY_BOUND: prefer FP8 before INT4.
+- For MEMORY_BOUND: prefer FP8 weight-only (W8A16) before INT4.
 - For L2_BOUND with empty space, return [].
 - Do not output configs outside the search space.
+
+Precision implementation (do not over-claim in reasoning):
+- The repo's FP8 path is **weight-only W8A16** in Triton (FP8 weights, FP16 activations/compute).
+- It is **not** native FP8 **W8A8** tensor-core inference (cuBLASLt / Transformer Engine). Do not describe
+  current FP8 as unlocking H100 FP8 tensor-core throughput vs FP16.
 
 Generate exactly {n_candidates} candidates.
 Output ONLY a JSON array of objects with optional keys:
@@ -128,13 +133,18 @@ def _heuristic_configs(diagnosis: Diagnosis, shape: dict, current_precision: str
         for p in space.get("precision", []):
             tier = PRECISION_TIERS.get(p, {})
             w_mb = H * K * N * tier.get("bytes_per_param", 1) / 1e6
+            reason = (
+                f"FP8 weight-only W8A16: weight ~{w_mb:.0f} MB (not native W8A8)"
+                if p == "fp8"
+                else f"{p.upper()} shrinks weight to ~{w_mb:.0f} MB"
+            )
             out.append(
                 {
                     "precision": p,
                     "BLOCK_M": space.get("BLOCK_M", [16])[0],
                     "BLOCK_N": space.get("BLOCK_N", [64])[-1],
                     "BLOCK_K": space.get("BLOCK_K", [128])[-1],
-                    "reasoning": f"{p.upper()} shrinks weight to {w_mb:.0f} MB",
+                    "reasoning": reason,
                 }
             )
     else:
