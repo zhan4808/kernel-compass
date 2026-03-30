@@ -25,3 +25,15 @@ data/*
 *.ptx
 *.cubin
 *.fatbin
+
+# LaTeX build (paper/)
+paper/*.aux
+paper/*.log
+paper/*.out
+paper/*.toc
+paper/*.bbl
+paper/*.blg
+paper/*.fdb_latexmk
+paper/*.fls
+paper/*.synctex.gz
+paper/main.pdf

@@ -1,0 +1,169 @@
+% kernel-compass — draft paper (counter-grounded optimization for MLA reconstruction)
+% Build: pdflatex + bibtex + pdflatex x2 (see paper/README.md)
+
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{microtype}
+\usepackage[numbers,sort&compress]{natbib}
+
+\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue, citecolor=blue}
+
+\title{\textsf{kernel-compass}: Counter-Grounded Optimization for\\
+Multi-Latent Attention Reconstruction Kernels}
+\author{Robert Zhang}
+\date{Draft --- \today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Neural kernel optimizers often reward latency or throughput alone, which can accept changes that do not address the true bottleneck---for example, aggressive weight quantization when weights are already \emph{L2-resident} and DRAM bandwidth is not limiting.
+We present \textsf{kernel-compass}, a small open-source pipeline that closes the loop with \emph{hardware counters}: Nsight Compute (or a CUPTI-based fallback) produces per-kernel profiles; a lightweight classifier maps profiles to bottleneck classes (\textsc{memory\_bound}, \textsc{l2\_bound}, \textsc{compute\_bound}, \textsc{occupancy\_limited}); and a grid or LLM-guided search proposes precision and tiling variants that are accepted only when counter-consistent predicates hold.
+We ground the story in batched matrix multiplies that model DeepSeek-style MLA reconstruction, with BF16 as the experimental baseline and honest labeling of our FP8 path as \emph{weight-only} W8A16 (FP8 weights, FP16 compute in Triton), not native FP8 W8A8 tensor-core inference.
+This draft states the system design and evaluation protocol; tables of measured NCU metrics on NVIDIA H100 are left for a GPU run (\S\ref{sec:data}).
+\end{abstract}
+
+\section{Introduction}
+Large language model inference stacks increasingly rely on compressed attention and reconstruction paths.
+Multi-latent attention (MLA) stores a low-rank latent and reconstructs head views via batched GEMMs each decode step~\citep{deepseekv3}.
+Prior work (companion ``cache-barrier'' line~\citep{cachebarrier2026}) argues that when reconstruction weights fit in last-level cache, latency-only comparisons can misleadingly favor low-bit kernels: HBM traffic was never the bottleneck.
+
+\textsf{kernel-compass}\footnote{\url{https://github.com/zhan4808/kernel-compass}} implements a \emph{counter-grounded} alternative: profile $\rightarrow$ diagnose $\rightarrow$ propose $\rightarrow$ verify~\citep{kernelcompass2026}.
+The key idea is not a new GEMM kernel but a \emph{feedback interface}: the optimizer sees SM throughput, DRAM throughput, L2 hit behavior, and occupancy before recommending quantization or tile changes.
+
+\paragraph{Contributions (this draft).}
+\begin{itemize}\itemsep0pt
+  \item A reproducible pipeline from NCU CSV (or CUPTI estimates) to structured \texttt{KernelProfile} objects and a four-class bottleneck taxonomy.
+  \item An optimization loop that \emph{skips} precision search when the classifier says \textsc{l2\_bound}, avoiding wasted profiling runs on shapes where quantization is counter-indicated.
+  \item Explicit precision taxonomy: BF16 baseline; FP8 \emph{weight-only} W8A16 in Triton; INT4 W4A16; with W8A8/cuBLASLt deferred to future work.
+  \item A validation harness (five synthetic BMM shapes) with expected counter bands and classifier checks, intended to be run on H100 with \texttt{ncu}.
+\end{itemize}
+
+\section{Background: MLA reconstruction as BMM}
+Per layer, reconstruction can be abstracted as batched matrix multiplies over head dimension $H$, batch $M$, and inner dimensions $K,N$.
+We follow the cache-barrier setup: a ``small weight'' shape $(H,M,K,N)=(128,1,128,512)$ places $\approx 16$\,MiB of BF16 weights (fits H100 L2); a ``large weight'' shape $(128,1,128,4096)$ uses $\approx 128$\,MiB BF16 weights (typically HBM-bound).
+The codebase also implements INT4 and FP8 weight-only Triton paths for ablations~\citep{kernelcompass2026}.
+
+\section{Profiling and profiles}
+\subsection{Metrics}
+Each aggregate profile includes: SM and DRAM throughput (\% of peak sustained), achieved occupancy, L1/L2 hit rates (derived from sector hit/miss counters where available), duration (summed over invocations), invocation count, and coefficient of variation across invocations.
+Implementation: \texttt{profiling/ncu\_runner.py} (Nsight Compute) with \texttt{--profile-from-start off} and CUDA profiler brackets for callable profiling; \texttt{CuptiRunner} when \texttt{ncu} is unavailable~\citep{nvidia_ncu}.
+
+\subsection{Classifier}
+Table~\ref{alg:class} summarizes \texttt{classify\_one} in \texttt{profiling/bottleneck.py}.
+Thresholds are heuristics tuned for H100-style behavior; A100 may require recalibration.
+
+\begin{table}[h]
+\centering
+\caption{Bottleneck classification (simplified; see \texttt{classify\_one})}
+\label{alg:class}
+\begin{tabular}{ll}
+\toprule
+Condition & Class \\
+\midrule
+DRAM $<40$\%, SM $<40$\%, L2 hit $>60$\% & \textsc{l2\_bound} \\
+DRAM $>60$\%, SM $<50$\% & \textsc{memory\_bound} \\
+SM $>65$\% & \textsc{compute\_bound} \\
+$0<$ occ $<40$\% & \textsc{occupancy\_limited} \\
+else & \textsc{memory\_bound} (low confidence) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Optimization loop}
+Given baseline BF16 (or FP16) \texttt{torch.bmm}, the loop profiles the dominant kernel, classifies it, enumerates candidates, re-profiles, and applies \texttt{verify()}:
+
+\paragraph{Enumeration (\texttt{enumerate\_configs}).}
+If \textsc{l2\_bound}, return \emph{no} candidates (quantization is not explored).
+If \textsc{memory\_bound} and precision is BF16/FP16, try FP8 weight-only W8A16, then INT4 W4A16.
+If already FP8 and \textsc{memory\_bound}, try INT4 only.
+
+\paragraph{Verification (\texttt{verify}).}
+For \textsc{memory\_bound}: accept if latency improves by $>2\%$ \emph{and} post-kernel SM utilization stays below $80\%$ (guards against trading bandwidth for compute saturation without net win).
+Other classes use small SM/occupancy deltas; \textsc{l2\_bound} rejects precision changes by design.
+
+\paragraph{LLM stage.}
+\texttt{optimizer/llm.py} can propose tile sizes and precisions within a JSON search space; prompts state that current FP8 is W8A16 weight-only, not W8A8 tensor-core inference.
+
+\section{Precision claims (honest scope)}
+\begin{itemize}\itemsep0pt
+  \item \textbf{BF16/FP16:} cuBLAS \texttt{bmm}; baseline for experiments.
+  \item \textbf{FP8:} Triton kernel with FP8 \texttt{e4m3fn} weights and per-channel scales; activations and \texttt{tl.dot} path are FP16-equivalent---\textbf{not} native W8A8 on H100.
+  \item \textbf{INT4:} packed weights, dequantization in kernel; expected overhead when compute-bound.
+\end{itemize}
+We do \emph{not} claim benchmarks of ``native FP8 inference'' until a cuBLASLt/Transformer Engine W8A8 path is integrated and validated (e.g., via NCU tensor-core metrics).
+
+\section{Validation protocol}
+\label{sec:validation}
+\texttt{tests/test\_validation.py} runs:
+\begin{enumerate}\itemsep0pt
+  \item \textbf{Level 1:} timing and shape sanity for five cases: \texttt{bf16\_16mb}, \texttt{fp8\_16mb}, \texttt{int4\_16mb}, \texttt{bf16\_128mb}, \texttt{fp8\_128mb}.
+  \item \textbf{Level 2:} optional NCU (or CUPTI) profiling; counters compared to bands in \texttt{kernels/mla\_reconstruction.py}.
+  \item \textbf{Level 3:} classifier expectations (e.g., \texttt{bf16\_16mb} $\rightarrow$ \textsc{l2\_bound}, \texttt{int4\_16mb} $\rightarrow$ \textsc{compute\_bound}, large BF16/FP8 $\rightarrow$ \textsc{memory\_bound}).
+\end{enumerate}
+
+\section{Experiments to run on GPU}
+\label{sec:data}
+\textit{The following tables are placeholders until NCU runs on H100.}
+
+\begin{table}[h]
+\centering
+\caption{Validation cases: fill with median latency (ms), SM\%, DRAM\%, L2\% from \texttt{tests/test\_validation.py --ncu}.}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+Case & Latency & SM\% & DRAM\% & L2\% \\
+\midrule
+\texttt{bf16\_16mb} & --- & --- & --- & --- \\
+\texttt{fp8\_16mb}  & --- & --- & --- & --- \\
+\texttt{int4\_16mb} & --- & --- & --- & --- \\
+\texttt{bf16\_128mb}& --- & --- & --- & --- \\
+\texttt{fp8\_128mb} & --- & --- & --- & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Grid search outcomes (\texttt{optimizer.loop --grid}): fill with ACCEPTED/REJECTED and $\Delta$latency for each shape.}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Shape (MiB est.) & Class & Candidates tried & Outcome \\
+\midrule
+$128\times1\times128\times512$ BF16 & --- & 0 (L2) & --- \\
+$128\times1\times128\times4096$ BF16 & --- & FP8, INT4 & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{\texttt{--compare}: iterations to first acceptance and wasted runs (grid vs LLM/heuristic).}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+Demo shape & Grid tries & Grid first accept & LLM tries & LLM first accept \\
+\midrule
+16\,MiB MLA & --- & --- & --- & --- \\
+128\,MiB MLA & --- & --- & --- & --- \\
+FFN decode & --- & --- & --- & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Related work and discussion}
+Kernel generation and evolutionary search often use timing as reward~\citep{kernelcompass2026}.
+Our contribution is methodological: tie proposals to bottleneck \emph{class} and counter \emph{trends}, aligned with roofline intuition for reconstruction GEMMs~\citep{cachebarrier2026}.
+Future work: native W8A8 FP8 path; stronger verification (e.g., require DRAM\% movement for memory-bound acceptance); fuller LLM integration with API keys and ablations.
+
+\section{Conclusion}
+\textsf{kernel-compass} is a compact reference implementation of counter-grounded optimization for MLA-style BMMs, with explicit handling of L2 residency vs HBM pressure and honest scoping of FP8 experiments.
+Fill \S\ref{sec:data} on an H100 with NCU to finalize empirical claims.
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\end{document}

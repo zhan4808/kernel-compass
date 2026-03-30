@@ -40,6 +40,7 @@ optimizer/
   loop.py          Stages 3–5 — candidate selection, proposal, validation
 
 data/              NCU CSVs and benchmark results (gitignored)
+paper/             LaTeX draft + GPU data checklist (see paper/README.md)
 DIRECTION.md       Roadmap and design notes
 ```
 
