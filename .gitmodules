@@ -1,0 +1,3 @@
+[submodule "cache-barrier"]
+	path = cache-barrier
+	url = git@github.com:zhan4808/cache-barrier.git
