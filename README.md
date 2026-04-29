@@ -3,6 +3,13 @@
 Automated GPU kernel optimization loop for transformer inference, seeded from
 the [cache-barrier](https://github.com/zhan4808/cache-barrier) paper on MLA reconstruction GEMMs.
 
+Clone with the pinned companion checkout:
+
+```bash
+git clone --recursive git@github.com:zhan4808/kernel-compass.git
+# or after a plain clone:  git submodule update --init --recursive
+```
+
 ## Pipeline
 
 ```
@@ -41,6 +48,7 @@ optimizer/
 
 data/              NCU CSVs and benchmark results (gitignored)
 paper/             LaTeX draft + GPU data checklist (see paper/README.md)
+cache-barrier/     Git submodule — reference experiments/paper artifact (optional checkout)
 DIRECTION.md       Roadmap and design notes
 ```
 
