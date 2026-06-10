@@ -32,13 +32,23 @@ class CarmParams:
     t0_eager_us: float      # fixed cost per eager launch (incl. eventing)
 
 
-# H100: measured (cache-barrier carm_params.json). A100: scaled estimates.
+# H100: measured (cache-barrier profiling/measure_carm_params.py, 2026-06-10).
+# bw_l2_tbs is reduction-slope L2 read BW; GEMM-pattern serving can be higher (~6 TB/s).
+# A100: scaled estimates.
 CARM_PARAMS: dict[str, CarmParams] = {
-    "h100": CarmParams(bw_hbm_tbs=3.146, bw_l2_tbs=6.3, c_eff_mb=36.0,
-                       peak_tflops=989.0, t0_graph_us=2.795, t0_eager_us=15.4),
+    "h100": CarmParams(bw_hbm_tbs=3.146, bw_l2_tbs=5.331, c_eff_mb=36.0,
+                       peak_tflops=989.4, t0_graph_us=2.802, t0_eager_us=18.048),
     "a100": CarmParams(bw_hbm_tbs=1.94, bw_l2_tbs=4.0, c_eff_mb=29.0,
                        peak_tflops=312.0, t0_graph_us=3.5, t0_eager_us=18.0),
 }
+
+# MLA W4A16 dequant packed-byte throughput (fitted, cache-barrier plot_cache_aware_roofline.py)
+INT4_BLOCK_M = 16
+INT4_WT_PACKED_BYTES = 128 * 128 * 512 // 2  # H*K*N/2 for MLA shape
+INT4_R_DQ_BYTES_PER_S = 0.496e12  # fitted packed-byte dequant throughput
+
+# FlagGems fused_moe W8A16 in-core conversion ceiling (warm NCU, Mixtral shape)
+MOE_W8A16_PEAK_TFLOPS = 305.0
 
 
 class CarmRegime(Enum):
@@ -62,6 +72,122 @@ def params_for(gpu: str = "h100") -> CarmParams:
 def bw_ws_tbs(ws_bytes: float, p: CarmParams) -> float:
     """Capacity-gated bandwidth: a working set AT C_eff already thrashes (LRU)."""
     return p.bw_l2_tbs if ws_bytes < p.c_eff_mb * 1024 * 1024 else p.bw_hbm_tbs
+
+
+def predict_fp16_recon_us(flops: float, fp16_bytes: float, gpu: str = "h100", graphed: bool = True) -> float:
+    """FP16 reconstruction BMM: weight+act+output bytes, capacity-gated BW."""
+    return predict_us(flops, fp16_bytes, gpu=gpu, graphed=graphed)
+
+
+def predict_int4_recon_us(bs: int, gpu: str = "h100", graphed: bool = True) -> float:
+    """INT4 W4A16 MLA kernel: dequant in-core ceiling (not bandwidth)."""
+    import math
+
+    p = params_for(gpu)
+    t0 = p.t0_graph_us if graphed else p.t0_eager_us
+    tiles = math.ceil(bs / INT4_BLOCK_M)
+    return t0 + INT4_WT_PACKED_BYTES * tiles / INT4_R_DQ_BYTES_PER_S * 1e6
+
+
+def validate_recon_mape(recon_points: list[dict], gpu: str = "h100") -> dict:
+    """MAPE for FP16/INT4 vs carm_params.json recon_points."""
+    rows = []
+    fp16_errs, int4_errs = [], []
+    for pt in recon_points:
+        pred_f = predict_fp16_recon_us(pt["flops"], pt["fp16_bytes"], gpu=gpu)
+        pred_i = predict_int4_recon_us(pt["bs"], gpu=gpu)
+        rows.append({
+            "bs": pt["bs"],
+            "fp16_us": pt["fp16_us"],
+            "fp16_pred": round(pred_f, 2),
+            "int4_us": pt["int4_us"],
+            "int4_pred": round(pred_i, 2),
+        })
+        fp16_errs.append(abs(pred_f - pt["fp16_us"]) / pt["fp16_us"])
+        int4_errs.append(abs(pred_i - pt["int4_us"]) / pt["int4_us"])
+    n = max(len(fp16_errs), 1)
+    return {
+        "fp16_mape_pct": round(sum(fp16_errs) / n * 100, 1),
+        "int4_mape_pct": round(sum(int4_errs) / n * 100, 1),
+        "rows": rows,
+    }
+
+
+@dataclass(frozen=True)
+class MoeShape:
+    E: int
+    H: int
+    I: int
+    topk: int = 2
+
+
+def moe_flops(tokens: int, shape: MoeShape) -> float:
+    """SwiGLU MoE: GEMM1 (gate+up) + GEMM2 per routed token."""
+    T, k, H, I = tokens, shape.topk, shape.H, shape.I
+    gemm1 = 2 * T * k * (2 * H * (2 * I))
+    gemm2 = 2 * T * k * (I * H)
+    return float(gemm1 + gemm2)
+
+
+# Graph-timed Mixtral anchors (cache-barrier fused_moe extended sweep, W8A16 fix)
+_MOE_BF16_ANCHORS: list[tuple[int, float]] = [(16, 968), (64, 1224), (128, 1000), (256, 1242), (512, 5311)]
+_MOE_W816_ANCHORS: list[tuple[int, float]] = [(16, 564), (64, 711), (128, 833), (256, 1209), (512, 1990)]
+
+
+def _interp_us(tokens: int, anchors: list[tuple[int, float]]) -> float:
+    """Log-linear interpolation between measured graph-timed anchors."""
+    import math
+
+    if tokens <= anchors[0][0]:
+        return anchors[0][1] * (tokens / anchors[0][0])
+    if tokens >= anchors[-1][0]:
+        t0, u0 = anchors[-2]
+        t1, u1 = anchors[-1]
+        slope = (math.log(u1) - math.log(u0)) / (math.log(t1) - math.log(t0))
+        return u1 * math.exp(slope * (math.log(tokens) - math.log(t1)))
+    for (t0, u0), (t1, u1) in zip(anchors, anchors[1:]):
+        if t0 <= tokens <= t1:
+            if t0 == t1:
+                return u0
+            frac = (math.log(tokens) - math.log(t0)) / (math.log(t1) - math.log(t0))
+            return u0 * ((u1 / u0) ** frac)
+    return anchors[-1][1]
+
+
+def predict_moe_bf16_us(tokens: int, shape: MoeShape | None = None, gpu: str = "h100") -> float:
+    """Graph-timed Mixtral bf16 latency (interpolated measured anchors)."""
+    del shape, gpu
+    return _interp_us(tokens, _MOE_BF16_ANCHORS)
+
+
+def predict_moe_w8a16_us(tokens: int, shape: MoeShape | None = None, gpu: str = "h100") -> float:
+    """Graph-timed fixed W8A16 latency (interpolated measured anchors)."""
+    del shape, gpu
+    return _interp_us(tokens, _MOE_W816_ANCHORS)
+
+
+def moe_crossover_tokens(
+    shape: MoeShape | None = None,
+    gpu: str = "h100",
+    t_max: int = 2048,
+) -> int | None:
+    """Smallest T where interpolated W8A16 latency >= bf16 (quantized stops winning)."""
+    del shape, gpu
+    for T in range(1, t_max + 1):
+        if predict_moe_w8a16_us(T) >= predict_moe_bf16_us(T):
+            return T
+    return None
+
+
+def moe_crossover_tokens_measured(rows: list[dict]) -> int | None:
+    """Crossover from measured sweep rows with w8a16_vs_bf16 (or w8a16/bf16 fields)."""
+    for r in sorted(rows, key=lambda x: x["T"]):
+        ratio = r.get("w8a16_vs_bf16")
+        if ratio is None and r.get("bf16") and r.get("w8a16"):
+            ratio = r["bf16"] / r["w8a16"]
+        if ratio is not None and ratio < 1.0:
+            return int(r["T"])
+    return None
 
 
 def predict_us(flops: float, bytes_moved: float, gpu: str = "h100", graphed: bool = True) -> float:

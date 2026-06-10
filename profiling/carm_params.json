@@ -1,0 +1,199 @@
+{
+  "gpu": "NVIDIA H100 80GB HBM3",
+  "peak_fp16_tflops": 989.4,
+  "hbm_read_tbs": 3.146,
+  "l2_read_tbs": 5.331,
+  "kernel_floor_us": 2.802,
+  "eager_floor_us": 18.048,
+  "recon_points": [
+    {
+      "bs": 1,
+      "fp16_us": 4.939,
+      "int4_us": 9.134,
+      "ai_fp16": 0.99,
+      "ai_int4": 3.737,
+      "fp16_tflops": 3.3967,
+      "int4_tflops": 1.8369,
+      "flops": 16777216,
+      "fp16_bytes": 16941056
+    },
+    {
+      "bs": 4,
+      "fp16_us": 4.959,
+      "int4_us": 9.618,
+      "ai_fp16": 3.85,
+      "ai_int4": 13.474,
+      "fp16_tflops": 13.5322,
+      "int4_tflops": 6.9771,
+      "flops": 67108864,
+      "fp16_bytes": 17432576
+    },
+    {
+      "bs": 16,
+      "fp16_us": 5.174,
+      "int4_us": 13.029,
+      "ai_fp16": 13.838,
+      "ai_int4": 38.642,
+      "fp16_tflops": 51.8776,
+      "int4_tflops": 20.6032,
+      "flops": 268435456,
+      "fp16_bytes": 19398656
+    },
+    {
+      "bs": 64,
+      "fp16_us": 7.295,
+      "int4_us": 39.849,
+      "ai_fp16": 39.385,
+      "ai_int4": 72.496,
+      "fp16_tflops": 147.1847,
+      "int4_tflops": 26.9454,
+      "flops": 1073741824,
+      "fp16_bytes": 27262976
+    },
+    {
+      "bs": 128,
+      "fp16_us": 14.63,
+      "int4_us": 75.179,
+      "ai_fp16": 56.889,
+      "ai_int4": 84.891,
+      "fp16_tflops": 146.7903,
+      "int4_tflops": 28.5649,
+      "flops": 2147483648,
+      "fp16_bytes": 37748736
+    },
+    {
+      "bs": 256,
+      "fp16_us": 25.617,
+      "int4_us": 144.304,
+      "ai_fp16": 73.143,
+      "ai_int4": 92.827,
+      "fp16_tflops": 167.6621,
+      "int4_tflops": 29.7633,
+      "flops": 4294967296,
+      "fp16_bytes": 58720256
+    },
+    {
+      "bs": 512,
+      "fp16_us": 40.623,
+      "int4_us": 283.643,
+      "ai_fp16": 85.333,
+      "ai_int4": 97.379,
+      "fp16_tflops": 211.4539,
+      "int4_tflops": 30.2843,
+      "flops": 8589934592,
+      "fp16_bytes": 100663296
+    }
+  ],
+  "fp16_size_sweep": {
+    "256": {
+      "weight_mb": 8.0,
+      "us_per_bmm": 3.515,
+      "eff_wt_bw_tbs": 0.0
+    },
+    "384": {
+      "weight_mb": 12.0,
+      "us_per_bmm": 4.119,
+      "eff_wt_bw_tbs": 0.0
+    },
+    "512": {
+      "weight_mb": 16.0,
+      "us_per_bmm": 4.75,
+      "eff_wt_bw_tbs": 0.0
+    },
+    "768": {
+      "weight_mb": 24.0,
+      "us_per_bmm": 6.081,
+      "eff_wt_bw_tbs": 0.0
+    },
+    "1024": {
+      "weight_mb": 32.0,
+      "us_per_bmm": 7.334,
+      "eff_wt_bw_tbs": 0.0
+    },
+    "1280": {
+      "weight_mb": 40.0,
+      "us_per_bmm": 16.61,
+      "eff_wt_bw_tbs": 0.0
+    },
+    "1536": {
+      "weight_mb": 48.0,
+      "us_per_bmm": 21.813,
+      "eff_wt_bw_tbs": 0.0
+    },
+    "1792": {
+      "weight_mb": 56.0,
+      "us_per_bmm": 24.274,
+      "eff_wt_bw_tbs": 0.0
+    },
+    "2048": {
+      "weight_mb": 64.0,
+      "us_per_bmm": 27.385,
+      "eff_wt_bw_tbs": 0.0
+    },
+    "2560": {
+      "weight_mb": 80.0,
+      "us_per_bmm": 33.303,
+      "eff_wt_bw_tbs": 0.0
+    },
+    "3072": {
+      "weight_mb": 96.0,
+      "us_per_bmm": 38.632,
+      "eff_wt_bw_tbs": 0.0
+    },
+    "4096": {
+      "weight_mb": 128.0,
+      "us_per_bmm": 49.11,
+      "eff_wt_bw_tbs": 0.0
+    }
+  },
+  "int4_size_sweep": {
+    "256": {
+      "weight_mb": 8.0,
+      "us_per_kernel": 5.522
+    },
+    "384": {
+      "weight_mb": 12.0,
+      "us_per_kernel": 7.394
+    },
+    "512": {
+      "weight_mb": 16.0,
+      "us_per_kernel": 9.06
+    },
+    "768": {
+      "weight_mb": 24.0,
+      "us_per_kernel": 12.618
+    },
+    "1024": {
+      "weight_mb": 32.0,
+      "us_per_kernel": 15.623
+    },
+    "1280": {
+      "weight_mb": 40.0,
+      "us_per_kernel": 19.01
+    },
+    "1536": {
+      "weight_mb": 48.0,
+      "us_per_kernel": 22.317
+    },
+    "1792": {
+      "weight_mb": 56.0,
+      "us_per_kernel": 25.521
+    },
+    "2048": {
+      "weight_mb": 64.0,
+      "us_per_kernel": 28.599
+    },
+    "2560": {
+      "weight_mb": 80.0,
+      "us_per_kernel": 34.912
+    },
+    "3072": {
+      "weight_mb": 96.0,
+      "us_per_kernel": 41.163
+    },
+    "4096": {
+      "weight_mb": 128.0,
+      "us_per_kernel": 55.374
+    }
+  }
+}

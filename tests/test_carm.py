@@ -6,7 +6,16 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from profiling.bottleneck import diagnose_shape  # noqa: E402
-from profiling.carm import CarmRegime, advise, bw_ws_tbs, params_for, predict_us  # noqa: E402
+from profiling.carm import (  # noqa: E402
+    CarmRegime,
+    advise,
+    bw_ws_tbs,
+    moe_crossover_tokens,
+    moe_crossover_tokens_measured,
+    params_for,
+    predict_us,
+    validate_recon_mape,
+)
 
 P = params_for("h100")
 MB = 1024 * 1024
@@ -31,12 +40,17 @@ def test_regimes():
 
 
 def test_prediction_matches_measured():
-    # Graph-timed measurements from cache-barrier (H100):
-    # 16 MB / bs=1 fp16 bmm: 4.9 us; 128 MB: 49.1 us
     p16 = predict_us(2 * 128 * 1 * 128 * 512, 16 * MB)
     p128 = predict_us(2 * 128 * 1 * 128 * 4096, 128 * MB)
     assert abs(p16 - 4.9) / 4.9 < 0.25
     assert abs(p128 - 49.1) / 49.1 < 0.25
+
+
+def test_moe_crossover_fixed_path():
+    # Extended sweep: W8A16 fix wins at all measured T (min ratio ~1.03 @ T=256)
+    assert moe_crossover_tokens() is None
+    rows = [{"T": 256, "w8a16_vs_bf16": 1.027}, {"T": 512, "w8a16_vs_bf16": 2.67}]
+    assert moe_crossover_tokens_measured(rows) is None
 
 
 if __name__ == "__main__":
