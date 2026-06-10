@@ -3,6 +3,14 @@
 Automated GPU kernel optimization loop for transformer inference, seeded from
 the [cache-barrier](https://github.com/zhan4808/cache-barrier) paper on MLA reconstruction GEMMs.
 
+> **2026-06 methodology update:** residency-aware classification requires
+> `ncu --cache-control none` (now the default in `ncu_runner`); under NCU's
+> default cache-flushed replay, `l2_hit_rate` is always near-zero and the
+> `L2_BOUND` class can never fire. Use effective parameters for decisions:
+> H100 effective L2 residency capacity is ~36 MB (not 50 MB nominal) and
+> effective L2-era serving bandwidth is ~4–6 TB/s (not ~12 TB/s). See
+> `DIRECTION.md` and cache-barrier `profiling/validation/` for the audit.
+
 Clone with the pinned companion checkout:
 
 ```bash

@@ -93,9 +93,14 @@ def run_ncu(
     python: str = sys.executable,
     extra_ncu_flags: str = "",
     kernel_regex: Optional[str] = None,
+    cache_control: str = "none",
 ) -> str:
+    # cache_control="none" is REQUIRED for L2-residency diagnosis: NCU's default
+    # ("all") flushes GPU caches before every replayed launch, so l2_hit_rate and
+    # dram bytes reflect a forced-cold cache and the L2_BOUND class can never fire.
+    # Use "all" only when you explicitly want cold-cache, replay-stable metrics.
     ncu = _ncu_binary()
-    cmd = [ncu, "--csv", "--target-processes", "all"]
+    cmd = [ncu, "--csv", "--target-processes", "all", "--cache-control", cache_control]
     if kernel_regex:
         cmd += ["--kernel-name", kernel_regex]
     if extra_ncu_flags:
@@ -210,7 +215,10 @@ class NcuRunner:
         iters: int = 5,
         label: Optional[str] = None,
         kernel_regex: Optional[str] = None,
+        cache_control: str = "none",
     ) -> list[KernelProfile]:
+        # See run_ncu: cache_control="none" preserves warm-loop L2 state so the
+        # l2_hit_rate metric reflects steady-state residency, not forced-cold replay.
         del args
         os.makedirs(self.output_dir, exist_ok=True)
         ncu = _ncu_binary()
@@ -223,6 +231,8 @@ class NcuRunner:
                 "--csv",
                 "--target-processes",
                 "all",
+                "--cache-control",
+                cache_control,
                 "--metrics",
                 ",".join(list(_METRICS.values()) + ["gpu__time_duration.sum"]),
                 "--profile-from-start",

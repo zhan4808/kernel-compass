@@ -25,6 +25,25 @@ recommendations automatically:
 
 This is the key contrast missing from latency-only optimization loops.
 
+### Corrections from the 2026-06 methodology audit (see cache-barrier `profiling/validation/`)
+
+- **NCU must run with `--cache-control none` for residency diagnosis.** The
+  default (`all`) flushes L2 before every replayed launch; under it,
+  `l2_hit_rate` is always near-zero and the `L2_BOUND` class can never fire.
+  `ncu_runner.run_ncu` / `NcuRunner.run` now default to `none`.
+- **Effective L2 capacity on H100 is ~32-40 MB, not the nominal 50 MB**
+  (LRU + partitioning). Residency-based decisions should use the measured
+  effective capacity, and effective L2-era serving bandwidth is ~4-6 TB/s
+  for GEMM access patterns, not the ~12 TB/s aggregate figure.
+- **"L2-resident -> reject weight-only quantization" remains the right
+  recommendation**, but for a stronger reason: even with L2 residency
+  removed (weight-rotation intervention), the dequant-bound INT4 kernel
+  only reaches parity with FP16 — it never wins. Reject INT4 in this regime
+  on kernel-efficiency grounds as well as residency grounds.
+- **Per-launch CUDA-event timing has a ~15 us floor** on this class of
+  µs-scale kernels; validation timing for accept/revert decisions should use
+  CUDA-graph timing (or compare medians of graph-captured loops).
+
 ## Compare-mode metrics
 
 `python -m optimizer.loop --compare` now reports:

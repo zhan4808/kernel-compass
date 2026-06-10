@@ -9,13 +9,22 @@ from dataclasses import dataclass
 class GpuSpec:
     name: str
     hbm_bw_gbs: float
-    l2_cache_mb: float
+    l2_cache_mb: float          # nominal capacity (datasheet)
     fp16_tflops: float
+    # Effective values for residency decisions (cache-barrier 2026-06 audit):
+    # LRU + partitioning make usable capacity smaller than nominal, and
+    # GEMM-pattern L2 serving bandwidth is far below the aggregate L2 figure.
+    # H100 values are measured; A100 values are scaled estimates (~72% of
+    # nominal capacity, same ratio as H100) pending direct measurement.
+    l2_effective_mb: float = 0.0
+    l2_eff_bw_gbs: float = 0.0
 
 
 GPU_SPECS: dict[str, GpuSpec] = {
-    "h100": GpuSpec(name="NVIDIA H100 SXM5", hbm_bw_gbs=3350.0, l2_cache_mb=50.0, fp16_tflops=989.0),
-    "a100": GpuSpec(name="NVIDIA A100 SXM4", hbm_bw_gbs=2039.0, l2_cache_mb=40.0, fp16_tflops=312.0),
+    "h100": GpuSpec(name="NVIDIA H100 SXM5", hbm_bw_gbs=3350.0, l2_cache_mb=50.0,
+                    fp16_tflops=989.0, l2_effective_mb=36.0, l2_eff_bw_gbs=6300.0),
+    "a100": GpuSpec(name="NVIDIA A100 SXM4", hbm_bw_gbs=2039.0, l2_cache_mb=40.0,
+                    fp16_tflops=312.0, l2_effective_mb=29.0, l2_eff_bw_gbs=4000.0),
 }
 
 
