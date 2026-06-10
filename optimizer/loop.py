@@ -97,20 +97,10 @@ def _make_kernel(shape: tuple, precision: str, tile_config: Optional[dict] = Non
         W_packed, scales = quantize_int4(W)
         return (lambda: batched_int4_gemm(A, W_packed, scales, K, BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)), "int4"
     if precision == "w8a8":
-        from kernels.w8a8 import quantize_acts_w8, quantize_weights_w8, w8a8_bmm
+        from kernels.baselines import make_w8a8_bmm_fn
 
-        A = torch.randn(H, M, K, dtype=torch.float16, device="cuda") / 4
-        W = torch.randn(H, K, N, dtype=torch.float16, device="cuda") / 8
-        Wq, Ws = quantize_weights_w8(W)
-        qbuf = torch.empty_like(A, dtype=torch.int8)
-        sbuf = torch.empty(H * M, dtype=torch.float32, device="cuda")
-        obuf = torch.empty(H, M, N, dtype=torch.float16, device="cuda")
-
-        def _run():
-            quantize_acts_w8(A, qbuf, sbuf)
-            return w8a8_bmm(qbuf, Wq, sbuf, Ws, obuf)
-
-        return _run, "w8a8"
+        fn, _ = make_w8a8_bmm_fn(H, M, K, N)
+        return fn, "w8a8"
     raise ValueError(f"Unknown precision: {precision}")
 
 

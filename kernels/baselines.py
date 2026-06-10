@@ -1,6 +1,7 @@
-"""Baseline BMM wrappers: BF16 cuBLAS, INT4 Triton W4A16, FP8 weight-only W8A16 (Triton).
+"""Baseline BMM wrappers: BF16 cuBLAS, INT4 W4A16, FP8 W8A16, W8A8 INT8-MMA.
 
 FP8 path: FP8 weights dequantized to FP16 for tl.dot — not native W8A8 tensor-core GEMM.
+W8A8 path: int8 tl.dot -> int32 acc (Hopper IMMA), scales on accumulator only.
 """
 
 from __future__ import annotations
@@ -269,6 +270,37 @@ def bench_fp8_bmm(H: int, BS: int, K: int, N: int, warmup: int = 50, iters: int 
     w = torch.randn(H, K, N, dtype=torch.float16, device="cuda")
     w_fp8, scales = quantize_fp8(w)
     return _time_fn(lambda: batched_fp8_gemm(x, w_fp8, scales), warmup, iters)
+
+
+def make_w8a8_bmm_fn(H: int, BS: int, K: int, N: int):
+    """Return (fn, buffers) for graph-capturable W8A8 BMM (act-quant + INT8 MMA)."""
+    from kernels.w8a8 import quantize_acts_w8, quantize_weights_w8, w8a8_bmm
+
+    a = torch.randn(H, BS, K, dtype=torch.float16, device="cuda") / 4
+    w = torch.randn(H, K, N, dtype=torch.float16, device="cuda") / 8
+    wq, ws = quantize_weights_w8(w)
+    qbuf = torch.empty_like(a, dtype=torch.int8)
+    sbuf = torch.empty(H * BS, dtype=torch.float32, device="cuda")
+    obuf = torch.empty(H, BS, N, dtype=torch.float16, device="cuda")
+
+    def fn():
+        quantize_acts_w8(a, qbuf, sbuf)
+        return w8a8_bmm(qbuf, wq, sbuf, ws, obuf)
+
+    return fn, (a, w, wq, ws, qbuf, sbuf, obuf)
+
+
+def batched_w8a8_gemm(A: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
+    """End-to-end W8A8 batched BMM (dynamic act quant + INT8 MMA)."""
+    from kernels.w8a8 import quantize_acts_w8, quantize_weights_w8, w8a8_bmm_full
+
+    wq, ws = quantize_weights_w8(W)
+    return w8a8_bmm_full(A, wq, ws)
+
+
+def bench_w8a8_bmm(H: int, BS: int, K: int, N: int, warmup: int = 50, iters: int = 200) -> float:
+    fn, _ = make_w8a8_bmm_fn(H, BS, K, N)
+    return _time_fn(fn, warmup, iters)
 
 
 def l2_barrier_sweep(
