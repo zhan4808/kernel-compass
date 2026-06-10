@@ -24,7 +24,7 @@ from profiling.bottleneck import BottleneckClass, classify_one
 from profiling.metrics import KernelProfile
 
 
-def test_timing() -> bool:
+def _run_timing() -> bool:
     print("=" * 60)
     print("Level 1: Timing and shape sanity")
     print("=" * 60)
@@ -34,7 +34,7 @@ def test_timing() -> bool:
     return ok
 
 
-def test_ncu() -> tuple[bool, dict[str, KernelProfile]]:
+def _run_ncu() -> tuple[bool, dict[str, KernelProfile]]:
     """Level 2 validation with NCU, fallback to CUPTI estimation."""
     from profiling.ncu_runner import _CUPTI_WARNING, CuptiRunner, NcuRunner, ncu_has_permissions
 
@@ -85,10 +85,12 @@ _EXPECTED_CLASS: Dict[str, BottleneckClass] = {
     "fp8_16mb": BottleneckClass.L2_BOUND,
     "bf16_128mb": BottleneckClass.MEMORY_BOUND,
     "fp8_128mb": BottleneckClass.MEMORY_BOUND,
+    "w8a8_16mb": BottleneckClass.L2_BOUND,
+    "w8a8_128mb": BottleneckClass.MEMORY_BOUND,
 }
 
 
-def test_classifier(by_case: dict[str, KernelProfile]) -> bool:
+def _run_classifier(by_case: dict[str, KernelProfile]) -> bool:
     print("=" * 60)
     print("Level 3: Classifier validation")
     print("=" * 60)
@@ -109,15 +111,33 @@ def test_classifier(by_case: dict[str, KernelProfile]) -> bool:
     return all_pass
 
 
+# ── pytest entry points ──────────────────────────────────────────────────────
+
+def test_timing() -> None:
+    """Level 1: all validation kernels produce timing rows."""
+    assert _run_timing()
+
+
+def test_counters_and_classifier() -> None:
+    """Levels 2+3: counter ranges and bottleneck classification."""
+    import pytest
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    ncu_ok, by_case = _run_ncu()
+    assert ncu_ok, "counter validation outside expected ranges"
+    assert _run_classifier(by_case), "classifier mismatch"
+
+
 def main(enable_ncu: bool = False) -> int:
-    timing_ok = test_timing()
+    timing_ok = _run_timing()
     ncu_ok = True
     by_case: dict[str, KernelProfile] = {}
     if enable_ncu:
-        ncu_ok, by_case = test_ncu()
+        ncu_ok, by_case = _run_ncu()
     classifier_ok = True
     if by_case:
-        classifier_ok = test_classifier(by_case)
+        classifier_ok = _run_classifier(by_case)
     elif enable_ncu:
         classifier_ok = False
 

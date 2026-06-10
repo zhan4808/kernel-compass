@@ -8,12 +8,14 @@ fallback) as the feedback signal.
 - Stage 1 profiling: working (`NcuRunner` + `CuptiRunner` fallback)
 - Stage 2 classification: working (4-class taxonomy)
 - Stage 3 optimization loop: working (`--demo`, `--compare`)
-- Stage 4 LLM generation: scaffolded (`optimizer/llm.py`) with heuristic fallback
+- Stage 4 LLM generation: scaffolded (`optimizer/llm.py`) with heuristic
+  fallback; W8A8 is in the search space and the heuristic proposes it first
+  when memory-bound (verified ACCEPTED -30% on the 128 MB shape)
 
-Validation currently passes end-to-end:
+Validation currently passes end-to-end (7 cases incl. W8A8 16/128 MB):
 
-- `python tests/test_validation.py`
-- `python tests/test_validation.py --ncu`
+- `python3 -m pytest tests/` (19 tests: CARM, optimizer gating, W8A8, validation)
+- `python tests/test_validation.py --ncu` (counters + classifier, 7/7 PASS)
 
 ## Core result (demo-ready)
 

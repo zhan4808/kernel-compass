@@ -13,7 +13,7 @@ _BC = BottleneckClass
 
 SEARCH_SPACE: dict[BottleneckClass, dict] = {
     _BC.MEMORY_BOUND: {
-        "precision": ["fp8", "int4"],
+        "precision": ["w8a8", "fp8", "int4"],
         "BLOCK_M": [16, 32, 64],
         "BLOCK_N": [32, 64, 128],
         "BLOCK_K": [64, 128, 256],
@@ -31,7 +31,7 @@ SEARCH_SPACE: dict[BottleneckClass, dict] = {
     },
 }
 
-_BPE = {"bf16": 2, "fp16": 2, "fp8": 1, "int4": 0.5}
+_BPE = {"bf16": 2, "fp16": 2, "fp8": 1, "int4": 0.5, "w8a8": 1}
 
 
 def build_prompt(
@@ -65,11 +65,15 @@ Allowed search space:
 {space_json}
 
 Rules:
-- For MEMORY_BOUND: prefer FP8 weight-only (W8A16) before INT4.
+- For MEMORY_BOUND: prefer W8A8 (INT8 tensor-core MMA, no inner-loop dequant)
+  first, then FP8 weight-only (W8A16), then INT4.
 - For L2_BOUND with empty space, return [].
 - Do not output configs outside the search space.
 
 Precision implementation (do not over-claim in reasoning):
+- "w8a8" is INT8 tensor-core MMA (int8 tl.dot -> int32 accumulator, scales on
+  the accumulator only) - the only quantized tier measured to beat cuBLAS FP16
+  (1.4-1.5x at bs=1 when weights exceed the ~36 MB effective L2 capacity).
 - The repo's FP8 path is **weight-only W8A16** in Triton (FP8 weights, FP16 activations/compute).
 - It is **not** native FP8 **W8A8** tensor-core inference (cuBLASLt / Transformer Engine). Do not describe
   current FP8 as unlocking H100 FP8 tensor-core throughput vs FP16.
@@ -133,11 +137,12 @@ def _heuristic_configs(diagnosis: Diagnosis, shape: dict, current_precision: str
         for p in space.get("precision", []):
             tier = PRECISION_TIERS.get(p, {})
             w_mb = H * K * N * tier.get("bytes_per_param", 1) / 1e6
-            reason = (
-                f"FP8 weight-only W8A16: weight ~{w_mb:.0f} MB (not native W8A8)"
-                if p == "fp8"
-                else f"{p.upper()} shrinks weight to ~{w_mb:.0f} MB"
-            )
+            if p == "w8a8":
+                reason = f"W8A8 INT8-MMA: weight ~{w_mb:.0f} MB, no inner-loop dequant"
+            elif p == "fp8":
+                reason = f"FP8 weight-only W8A16: weight ~{w_mb:.0f} MB (not native W8A8)"
+            else:
+                reason = f"{p.upper()} shrinks weight to ~{w_mb:.0f} MB"
             out.append(
                 {
                     "precision": p,

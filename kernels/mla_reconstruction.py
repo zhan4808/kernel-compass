@@ -50,6 +50,20 @@ VALIDATION_CASES: Dict[str, ValidationExpected] = {
         l2_hit_rate=(0.0, 55.0),
         label="FP8 Triton W8A16 BMM, weight=64 MB actual (HBM-bound)",
     ),
+    # Warm NCU reference (cache-control none, bs=1): 16 MB int8 weights:
+    # DRAM 14% / SM 39% / L2 hit 93%; 64 MB (HBM-served): DRAM ~41% / SM ~54% / L2 ~11%.
+    "w8a8_16mb": ValidationExpected(
+        dram_bw_pct=(0.0, 40.0),
+        sm_pct=(15.0, 75.0),
+        l2_hit_rate=(60.0, 100.0),
+        label="W8A8 INT8-MMA BMM, weight=8 MB actual (L2-resident)",
+    ),
+    "w8a8_128mb": ValidationExpected(
+        dram_bw_pct=(20.0, 90.0),
+        sm_pct=(20.0, 90.0),
+        l2_hit_rate=(0.0, 45.0),
+        label="W8A8 INT8-MMA BMM, weight=64 MB actual (HBM-bound)",
+    ),
 }
 
 _CASE_SHAPES: Dict[str, Tuple[int, int, int, int]] = {
@@ -58,6 +72,8 @@ _CASE_SHAPES: Dict[str, Tuple[int, int, int, int]] = {
     "fp8_16mb": (128, 1, 128, 512),
     "bf16_128mb": (128, 1, 128, 4096),
     "fp8_128mb": (128, 1, 128, 4096),
+    "w8a8_16mb": (128, 1, 128, 512),
+    "w8a8_128mb": (128, 1, 128, 4096),
 }
 
 _CASE_WEIGHT_DTYPE: Dict[str, str] = {
@@ -66,9 +82,11 @@ _CASE_WEIGHT_DTYPE: Dict[str, str] = {
     "fp8_16mb": "fp8",
     "bf16_128mb": "bf16",
     "fp8_128mb": "fp8",
+    "w8a8_16mb": "w8a8",
+    "w8a8_128mb": "w8a8",
 }
 
-_WEIGHT_BPE = {"bf16": 2.0, "int4": 0.5, "fp8": 1.0}
+_WEIGHT_BPE = {"bf16": 2.0, "int4": 0.5, "fp8": 1.0, "w8a8": 1.0}
 _CASE_CACHE: dict[str, dict] = {}
 
 
@@ -84,6 +102,14 @@ def _ensure(case: str) -> dict:
         out["W_packed"], out["scales"] = quantize_int4(W.float())
     elif "fp8" in case:
         out["W_fp8"], out["scales"] = quantize_fp8(W.float())
+    elif "w8a8" in case:
+        from kernels.w8a8 import quantize_weights_w8
+
+        out["Wq"], out["Ws"] = quantize_weights_w8(W.half() / 8)
+        out["A_w8"] = A.half() / 4
+        out["qbuf"] = torch.empty(H, M, K, dtype=torch.int8, device="cuda")
+        out["sbuf"] = torch.empty(H * M, dtype=torch.float32, device="cuda")
+        out["obuf"] = torch.empty(H, M, N, dtype=torch.float16, device="cuda")
     _CASE_CACHE[case] = out
     return out
 
@@ -113,12 +139,30 @@ def case_fp8_128mb() -> torch.Tensor:
     return batched_fp8_gemm(t["A"].half(), t["W_fp8"], t["scales"])
 
 
+def _case_w8a8(case: str) -> torch.Tensor:
+    from kernels.w8a8 import quantize_acts_w8, w8a8_bmm
+
+    t = _ensure(case)
+    quantize_acts_w8(t["A_w8"], t["qbuf"], t["sbuf"])
+    return w8a8_bmm(t["qbuf"], t["Wq"], t["sbuf"], t["Ws"], t["obuf"])
+
+
+def case_w8a8_16mb() -> torch.Tensor:
+    return _case_w8a8("w8a8_16mb")
+
+
+def case_w8a8_128mb() -> torch.Tensor:
+    return _case_w8a8("w8a8_128mb")
+
+
 VALIDATION_KERNELS: Dict[str, callable] = {
     "bf16_16mb": case_bf16_16mb,
     "int4_16mb": case_int4_16mb,
     "fp8_16mb": case_fp8_16mb,
     "bf16_128mb": case_bf16_128mb,
     "fp8_128mb": case_fp8_128mb,
+    "w8a8_16mb": case_w8a8_16mb,
+    "w8a8_128mb": case_w8a8_128mb,
 }
 
 

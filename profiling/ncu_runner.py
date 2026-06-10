@@ -255,8 +255,8 @@ class NcuRunner:
 class CuptiRunner:
     """Fallback profiler using torch.profiler device timings + estimation."""
 
-    _WEIGHT_BPE = {"bf16": 2.0, "fp16": 2.0, "int4": 0.5, "fp8": 1.0}
-    _HAS_SCALES = {"bf16": False, "fp16": False, "int4": True, "fp8": True}
+    _WEIGHT_BPE = {"bf16": 2.0, "fp16": 2.0, "int4": 0.5, "fp8": 1.0, "w8a8": 1.0}
+    _HAS_SCALES = {"bf16": False, "fp16": False, "int4": True, "fp8": True, "w8a8": True}
 
     def __init__(self, gpu: str = "auto"):
         self.gpu_key = _resolve_gpu(gpu)
