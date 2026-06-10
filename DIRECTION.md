@@ -69,8 +69,15 @@ wasted runs on shapes where counter evidence already rules out the optimization.
 
 - **Baseline for experiments:** BF16 (default in `optimizer.loop` and demos).
 - **Implemented alternatives:**
+  - **INT8 W8A8 (`kernels/w8a8.py`)**: int8 `tl.dot` → int32 accumulator (IMMA tensor cores), per-channel weight + per-token activation scales applied once on the accumulator. No inner-loop dequant. Measured 1.4–1.5× over cuBLAS FP16 at bs=1 when weights exceed the ~36 MB effective L2 capacity; 0.7× when L2-served (the optimizer enumerates it only when HBM-bound).
   - FP8 **weight-only W8A16** (Triton: FP8 weights, FP16 activations/compute). Reduces weight bytes vs BF16 but does **not** use H100 native FP8 tensor cores.
-  - INT4 W4A16 (Triton, dequant overhead).
-- **Not yet implemented:** native FP8 **W8A8** (cuBLASLt / Transformer Engine) — add and verify via NCU before claiming “native FP8 inference” benchmarks. NVFP4 kernel path: taxonomy may exist; implementation as needed.
+  - INT4 W4A16 (Triton, dequant overhead — loses everywhere; kept as the cautionary arm).
+- **Not yet implemented:** native FP8 **W8A8** (cuBLASLt / Transformer Engine). NVFP4 kernel path: taxonomy may exist; implementation as needed.
 
-Paper framing: benchmark **precision strategies for MLA reconstruction weights** (BF16 baseline, FP8 weight-only W8A16, INT4 weight-only) and show the counter-grounded optimizer picks the right tool per regime — without claiming full hardware-native FP8 inference until W8A8 is wired.
+## CARM + graph-timed validation (2026-06)
+
+- `profiling/carm.py`: measured cache-aware roofline — `t = t0 + max(B/BW(WS), F/P)` with capacity-gated `BW(WS)` (6.3 TB/s below ~36 MB, 3.15 TB/s above) and explicit fixed cost (2.8 µs graphed, 15.4 µs eager). H100 parameters measured by cache-barrier `profiling/measure_carm_params.py`; A100 entries are scaled estimates.
+- `bottleneck.classify_one(profile, shape=...)` attaches `CarmAdvice`; when counters are inconclusive it falls back to the analytic regime instead of defaulting to memory_bound. `diagnose_shape()` works with no profiling at all.
+- `optimizer.loop` accept/reject decisions now use `carm.graph_time_us` (CUDA-graph timing) — eager per-launch timing has a ~15.5 µs floor that masks any µs-scale kernel change.
+
+Paper framing: benchmark **precision strategies for MLA reconstruction weights** (BF16 baseline, W8A8 INT8-MMA, FP8 weight-only W8A16, INT4 weight-only) and show the counter-grounded optimizer picks the right tool per regime, with the CARM prediction and the measured graph-timed latency agreeing on both sides of the L2 boundary.

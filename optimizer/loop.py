@@ -19,6 +19,10 @@ PRECISION_TIERS: dict[str, dict] = {
     # Current implementation: FP8 weights, FP16 activations, FP16 compute in Triton
     # (W8A16). Does not use H100 native FP8 tensor cores (W8A8); see cuBLASLt/TE TODO.
     "fp8": {"bytes_per_param": 1, "hw_native": False, "dequant_overhead": False},
+    # W8A8: INT8 weights AND activations, int8 tl.dot -> int32 acc (IMMA tensor
+    # cores), scales applied once on the accumulator — no inner-loop dequant.
+    # The only quantized tier measured to beat cuBLAS FP16 (1.4-1.5x, HBM-bound bs=1).
+    "w8a8": {"bytes_per_param": 1, "hw_native": True, "dequant_overhead": False},
     "int8": {"bytes_per_param": 1, "hw_native": True, "dequant_overhead": False},
     "int4": {"bytes_per_param": 0.5, "hw_native": False, "dequant_overhead": True},
     "nvfp4": {"bytes_per_param": 0.5, "hw_native": True, "dequant_overhead": False},
@@ -60,11 +64,12 @@ def enumerate_configs(bottleneck: BottleneckClass, current_precision: str) -> li
     if bottleneck == _BC.MEMORY_BOUND:
         if current_precision in ("bf16", "fp16"):
             return [
-                GridConfig("fp8", "FP8 weight-only W8A16 (recommended before INT4)"),
-                GridConfig("int4", "INT4 W4A16 (aggressive)"),
+                GridConfig("w8a8", "W8A8 INT8-MMA (no inner-loop dequant; measured winner when HBM-bound)"),
+                GridConfig("fp8", "FP8 weight-only W8A16 (dequant in-loop)"),
+                GridConfig("int4", "INT4 W4A16 (aggressive, dequant-bound)"),
             ]
         if current_precision == "fp8":
-            return [GridConfig("int4", "INT4 W4A16 (aggressive)")]
+            return [GridConfig("w8a8", "W8A8 INT8-MMA"), GridConfig("int4", "INT4 W4A16 (aggressive)")]
     return []
 
 
@@ -91,6 +96,21 @@ def _make_kernel(shape: tuple, precision: str, tile_config: Optional[dict] = Non
         W = torch.randn(H, K, N, dtype=torch.float16, device="cuda")
         W_packed, scales = quantize_int4(W)
         return (lambda: batched_int4_gemm(A, W_packed, scales, K, BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)), "int4"
+    if precision == "w8a8":
+        from kernels.w8a8 import quantize_acts_w8, quantize_weights_w8, w8a8_bmm
+
+        A = torch.randn(H, M, K, dtype=torch.float16, device="cuda") / 4
+        W = torch.randn(H, K, N, dtype=torch.float16, device="cuda") / 8
+        Wq, Ws = quantize_weights_w8(W)
+        qbuf = torch.empty_like(A, dtype=torch.int8)
+        sbuf = torch.empty(H * M, dtype=torch.float32, device="cuda")
+        obuf = torch.empty(H, M, N, dtype=torch.float16, device="cuda")
+
+        def _run():
+            quantize_acts_w8(A, qbuf, sbuf)
+            return w8a8_bmm(qbuf, Wq, sbuf, Ws, obuf)
+
+        return _run, "w8a8"
     raise ValueError(f"Unknown precision: {precision}")
 
 
@@ -102,10 +122,14 @@ def _profile_kernel(runner, fn: Callable, shape: tuple, weight_dtype: str, warmu
     return runner.run(fn, warmup=warmup, iters=iters, label=label)
 
 
-def verify(before: KernelProfile, after: KernelProfile, bottleneck: BottleneckClass, config: GridConfig, shape: tuple) -> OptimizationResult:
+def verify(before: KernelProfile, after: KernelProfile, bottleneck: BottleneckClass, config: GridConfig, shape: tuple,
+           lat_before_us: Optional[float] = None, lat_after_us: Optional[float] = None) -> OptimizationResult:
+    """Accept/reject. Pass graph-timed latencies (lat_*_us) whenever possible:
+    eager per-launch timing has a ~15.5 us floor that masks any change to a
+    microsecond-scale kernel and inflates small-kernel latency 3-5x."""
     after_diag = classify_one(after)
-    lat_b = before.avg_duration_us
-    lat_a = after.avg_duration_us
+    lat_b = lat_before_us if lat_before_us is not None else before.avg_duration_us
+    lat_a = lat_after_us if lat_after_us is not None else after.avg_duration_us
     lat_delta = (lat_a - lat_b) / lat_b * 100 if lat_b > 0 else 0.0
     base = dict(
         kernel_name=before.kernel_name,
@@ -132,6 +156,16 @@ def verify(before: KernelProfile, after: KernelProfile, bottleneck: BottleneckCl
     return OptimizationResult(**base, accepted=False, rejection_reason="Unknown bottleneck class.")
 
 
+def _graph_lat_us(fn: Callable) -> Optional[float]:
+    from profiling.carm import graph_time_us
+
+    try:
+        return graph_time_us(fn)
+    except Exception as exc:  # e.g. op not graph-capturable
+        print(f"    (graph timing unavailable, falling back to counter latency: {exc})")
+        return None
+
+
 def optimize_grid(kernel_fn: Callable, shape: tuple, current_precision: str = "bf16", warmup: int = 10, iters: int = 5) -> list[OptimizationResult]:
     from profiling.ncu_runner import CuptiRunner, NcuRunner, ncu_has_permissions
 
@@ -140,15 +174,21 @@ def optimize_grid(kernel_fn: Callable, shape: tuple, current_precision: str = "b
     if not profiles:
         return []
     profile = max(profiles, key=lambda p: p.duration_us)
-    diag = classify_one(profile)
-    print(f"  Baseline: {diag.bottleneck.value} | SM={profile.sm_pct:.1f}% DRAM={profile.dram_bw_pct:.1f}% L2={profile.l2_hit_rate:.1f}%")
+    diag = classify_one(profile, shape=shape, dtype_bytes=PRECISION_TIERS[current_precision]["bytes_per_param"])
+    lat_base = _graph_lat_us(kernel_fn)
+    print(f"  Baseline: {diag.bottleneck.value} | SM={profile.sm_pct:.1f}% DRAM={profile.dram_bw_pct:.1f}% L2={profile.l2_hit_rate:.1f}%"
+          + (f" | graph-timed {lat_base:.2f} us" if lat_base else ""))
+    if diag.carm is not None:
+        print(f"  CARM: {diag.carm.regime.value}, predicted {diag.carm.predicted_us:.2f} us — {diag.carm.recommendation}")
     results: list[OptimizationResult] = []
     for cfg in enumerate_configs(diag.bottleneck, current_precision):
         new_fn, wd = _make_kernel(shape, cfg.precision)
         new_profiles = _profile_kernel(runner, new_fn, shape, wd, warmup, iters, cfg.precision)
         if not new_profiles:
             continue
-        r = verify(profile, max(new_profiles, key=lambda p: p.duration_us), diag.bottleneck, cfg, shape)
+        lat_new = _graph_lat_us(new_fn) if lat_base is not None else None
+        r = verify(profile, max(new_profiles, key=lambda p: p.duration_us), diag.bottleneck, cfg, shape,
+                   lat_before_us=lat_base, lat_after_us=lat_new)
         results.append(r)
         print(f"    {'ACCEPTED' if r.accepted else 'REJECTED'} {cfg.label} ({r.latency_delta_pct:+.1f}%)")
     return results
@@ -171,7 +211,8 @@ def optimize_llm(
     if not profiles:
         return []
     profile = max(profiles, key=lambda p: p.duration_us)
-    diag = classify_one(profile)
+    diag = classify_one(profile, shape=shape, dtype_bytes=PRECISION_TIERS[current_precision]["bytes_per_param"])
+    lat_base = _graph_lat_us(kernel_fn)
     sd = {"H": shape[0], "M": shape[1], "K": shape[2], "N": shape[3]}
     cfgs = generate_configs(diag, profile, sd, current_precision=current_precision, n_candidates=n_candidates, force_heuristic=force_heuristic)
     out: list[OptimizationResult] = []
@@ -182,7 +223,9 @@ def optimize_llm(
         new_profiles = _profile_kernel(runner, new_fn, shape, wd, warmup, iters, prec)
         if not new_profiles:
             continue
-        r = verify(profile, max(new_profiles, key=lambda p: p.duration_us), diag.bottleneck, GridConfig(prec, raw.get("reasoning", prec)), shape)
+        lat_new = _graph_lat_us(new_fn) if lat_base is not None else None
+        r = verify(profile, max(new_profiles, key=lambda p: p.duration_us), diag.bottleneck, GridConfig(prec, raw.get("reasoning", prec)), shape,
+                   lat_before_us=lat_base, lat_after_us=lat_new)
         out.append(r)
         print(f"    {'ACCEPTED' if r.accepted else 'REJECTED'} {raw.get('reasoning', prec)} ({r.latency_delta_pct:+.1f}%)")
     return out

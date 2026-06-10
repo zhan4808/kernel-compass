@@ -11,6 +11,23 @@ the [cache-barrier](https://github.com/zhan4808/cache-barrier) paper on MLA reco
 > effective L2-era serving bandwidth is ~4–6 TB/s (not ~12 TB/s). See
 > `DIRECTION.md` and cache-barrier `profiling/validation/` for the audit.
 
+**CARM integration (2026-06):** `profiling/carm.py` implements the measured
+cache-aware roofline (capacity-gated bandwidth, explicit launch fixed cost
+t0 = 2.8 µs graph / 15.4 µs eager). `bottleneck.classify_one(shape=...)`
+attaches an analytic `CarmAdvice` and falls back to it when counters are
+inconclusive; `diagnose_shape()` gives the regime with no profiling at all.
+The optimizer loop now validates with CUDA-graph timing (`carm.graph_time_us`,
+the only event timing that sees past the eager launch floor) and includes a
+**W8A8 INT8-MMA arm** (`kernels/w8a8.py`) — the only quantized tier measured
+to beat cuBLAS FP16 (1.4–1.5× when HBM-bound at bs=1; rejected automatically
+when L2-served or compute-bound):
+
+```bash
+python3 -m optimizer.loop --demo
+#  16 MB case → CARM: l2_served  → no quantization enumerated
+# 128 MB case → CARM: hbm_bound  → W8A8 ACCEPTED (-29% graph-timed)
+```
+
 Clone with the pinned companion checkout:
 
 ```bash
