@@ -30,16 +30,39 @@ class CarmParams:
     peak_tflops: float
     t0_graph_us: float      # fixed cost per launch under CUDA graphs
     t0_eager_us: float      # fixed cost per eager launch (incl. eventing)
+    # GPU-parameterization (cache-barrier CUDA validation, 2026-06-19): which
+    # precisions have native tensor-core MMA, and that MMA's peak relative to
+    # bf16. A weight-only-quant kernel (W8A16/W4A16, bf16 compute) is bounded by
+    # the in-core dequant ceiling regardless of native_mma; a matched kernel
+    # (W8A8/W4A4) reaches native_peak_mult x peak only if its precision is
+    # native, else it falls back to the dequant ceiling. This is what moves the
+    # quant-vs-dense crossover across hardware (H100 has no native FP4; B200 does).
+    native_mma: tuple[str, ...] = ()
+    native_peak_mult: tuple[tuple[str, float], ...] = ()
+    dequant_ceiling_tflops: float = 0.0   # in-core dequant ceiling (weight-only)
 
 
-# H100: measured (cache-barrier profiling/measure_carm_params.py, 2026-06-10).
+# H100: measured (cache-barrier profiling/measure_carm_params.py 2026-06-10;
+#       ceilings from the CUDA MoE sweep profiling/cuda_validation 2026-06-19).
 # bw_l2_tbs is reduction-slope L2 read BW; GEMM-pattern serving can be higher (~6 TB/s).
-# A100: scaled estimates.
+# A100: scaled estimates.  B200: PROJECTED from public Blackwell specs (native FP4,
+#       ~96 MB L2, ~8 TB/s HBM3e) -- the Blackwell hook, NOT measured.
 CARM_PARAMS: dict[str, CarmParams] = {
     "h100": CarmParams(bw_hbm_tbs=3.146, bw_l2_tbs=5.331, c_eff_mb=36.0,
-                       peak_tflops=989.4, t0_graph_us=2.802, t0_eager_us=18.048),
+                       peak_tflops=989.4, t0_graph_us=2.802, t0_eager_us=18.048,
+                       native_mma=("int8", "fp8"),
+                       native_peak_mult=(("int8", 2.0), ("fp8", 2.0)),
+                       dequant_ceiling_tflops=422.9),
     "a100": CarmParams(bw_hbm_tbs=1.94, bw_l2_tbs=4.0, c_eff_mb=29.0,
-                       peak_tflops=312.0, t0_graph_us=3.5, t0_eager_us=18.0),
+                       peak_tflops=312.0, t0_graph_us=3.5, t0_eager_us=18.0,
+                       native_mma=("int8",),
+                       native_peak_mult=(("int8", 2.0),),
+                       dequant_ceiling_tflops=140.0),
+    "b200": CarmParams(bw_hbm_tbs=8.0, bw_l2_tbs=10.0, c_eff_mb=96.0,
+                       peak_tflops=2250.0, t0_graph_us=2.5, t0_eager_us=16.0,
+                       native_mma=("int8", "fp8", "fp4"),
+                       native_peak_mult=(("int8", 2.0), ("fp8", 2.0), ("fp4", 4.0)),
+                       dequant_ceiling_tflops=960.0),
 }
 
 # MLA W4A16 dequant packed-byte throughput (fitted, cache-barrier plot_cache_aware_roofline.py)
@@ -133,6 +156,17 @@ def moe_flops(tokens: int, shape: MoeShape) -> float:
 _MOE_BF16_ANCHORS: list[tuple[int, float]] = [(16, 968), (64, 1224), (128, 1000), (256, 1242), (512, 5311)]
 _MOE_W816_ANCHORS: list[tuple[int, float]] = [(16, 564), (64, 711), (128, 833), (256, 1209), (512, 1990)]
 
+# Tuned-CUDA Marlin anchors (cache-barrier cuda_validation, vLLM 0.20.2, 2026-06-19).
+# Unlike the Triton bf16 baseline (which scaled super-linearly and made quant look
+# like a high-T win), the tuned-CUDA bf16 fused_experts is competent at high T, so
+# weight-only quant LOSES once compute-bound -- the crossover the paper predicts.
+_MOE_BF16_CUDA_ANCHORS: list[tuple[int, float]] = [
+    (16, 953), (64, 962), (128, 999), (256, 1386), (512, 2210),
+    (1024, 2404), (1536, 2641), (2048, 3377)]
+_MOE_FP8_CUDA_ANCHORS: list[tuple[int, float]] = [
+    (16, 502), (64, 525), (128, 568), (256, 1013), (512, 1791),
+    (1024, 3071), (1536, 4475), (2048, 5690)]
+
 
 def _interp_us(tokens: int, anchors: list[tuple[int, float]]) -> float:
     """Log-linear interpolation between measured graph-timed anchors."""
@@ -187,6 +221,29 @@ def moe_crossover_tokens_measured(rows: list[dict]) -> int | None:
             ratio = r["bf16"] / r["w8a16"]
         if ratio is not None and ratio < 1.0:
             return int(r["T"])
+    return None
+
+
+def predict_moe_bf16_cuda_us(tokens: int) -> float:
+    """Graph-timed tuned-CUDA (Marlin) bf16 MoE latency (interpolated anchors)."""
+    return _interp_us(tokens, _MOE_BF16_CUDA_ANCHORS)
+
+
+def predict_moe_fp8_cuda_us(tokens: int) -> float:
+    """Graph-timed tuned-CUDA fp8 W8A16 MoE latency (interpolated anchors)."""
+    return _interp_us(tokens, _MOE_FP8_CUDA_ANCHORS)
+
+
+def moe_crossover_tokens_cuda(t_max: int = 2048) -> int | None:
+    """Smallest T where tuned-CUDA fp8 W8A16 stops beating bf16 (measured ~600).
+
+    Unlike the Triton path (quant wins at all T because the bf16 baseline was
+    pathologically slow at high T), the tuned-CUDA fp8 path crosses bf16 in the
+    few-hundred-token range -- the cache-aware-roofline crossover, finally visible
+    once the dense baseline is competent."""
+    for T in range(1, t_max + 1):
+        if predict_moe_fp8_cuda_us(T) >= predict_moe_bf16_cuda_us(T):
+            return T
     return None
 
 
