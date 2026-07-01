@@ -25,6 +25,12 @@ GPU_SPECS: dict[str, GpuSpec] = {
                     fp16_tflops=989.0, l2_effective_mb=36.0, l2_eff_bw_gbs=6300.0),
     "a100": GpuSpec(name="NVIDIA A100 SXM4", hbm_bw_gbs=2039.0, l2_cache_mb=40.0,
                     fp16_tflops=312.0, l2_effective_mb=29.0, l2_eff_bw_gbs=4000.0),
+    # PROJECTED from public Blackwell specs (native FP4 MMA); NOT measured.
+    # Effective L2/BW are estimates pending direct measurement on-device.
+    "b200": GpuSpec(name="NVIDIA B200 SXM (PROJECTED)", hbm_bw_gbs=8000.0, l2_cache_mb=126.0,
+                    fp16_tflops=2250.0, l2_effective_mb=96.0, l2_eff_bw_gbs=11000.0),
+    "b100": GpuSpec(name="NVIDIA B100 SXM (PROJECTED)", hbm_bw_gbs=7700.0, l2_cache_mb=126.0,
+                    fp16_tflops=1800.0, l2_effective_mb=96.0, l2_eff_bw_gbs=10500.0),
 }
 
 

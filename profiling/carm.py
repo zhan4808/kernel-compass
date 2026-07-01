@@ -63,6 +63,13 @@ CARM_PARAMS: dict[str, CarmParams] = {
                        native_mma=("int8", "fp8", "fp4"),
                        native_peak_mult=(("int8", 2.0), ("fp8", 2.0), ("fp4", 4.0)),
                        dequant_ceiling_tflops=960.0),
+    # B100: PROJECTED lower-power SM100 sibling of B200 (same native FP4 MMA and
+    #       HBM3e memory system, lower clocks/TDP -> ~0.8x compute). NOT measured.
+    "b100": CarmParams(bw_hbm_tbs=7.7, bw_l2_tbs=9.6, c_eff_mb=96.0,
+                       peak_tflops=1800.0, t0_graph_us=2.5, t0_eager_us=16.0,
+                       native_mma=("int8", "fp8", "fp4"),
+                       native_peak_mult=(("int8", 2.0), ("fp8", 2.0), ("fp4", 4.0)),
+                       dequant_ceiling_tflops=770.0),
 }
 
 # MLA W4A16 dequant packed-byte throughput (fitted, cache-barrier plot_cache_aware_roofline.py)
